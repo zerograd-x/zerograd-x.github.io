@@ -1,1 +1,869 @@
-# zerograd-x.github.io
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashAttention: from a data-movement problem, step by step to the solution</title>
+<style>
+:root{
+  --bg:#ffffff; --bg-soft:#f7f8fa; --bg-code:#f2f4f7;
+  --fg:#1a1d21; --fg-soft:#5a6472; --fg-faint:#8a94a3;
+  --line:#e3e7ed; --line-strong:#cbd2dc;
+  --accent:#0b6bcb; --accent-soft:#e8f1fc;
+  --warn:#b4690e; --warn-soft:#fdf3e3;
+  --ok:#1a7f45; --ok-soft:#e7f5ec;
+  --bad:#c0392b; --bad-soft:#fdecea;
+  --maxw:840px;
+}
+html[data-theme="dark"]{
+  --bg:#12151a; --bg-soft:#181c23; --bg-code:#1d222b;
+  --fg:#e6e9ee; --fg-soft:#a8b2c1; --fg-faint:#7b8697;
+  --line:#262c36; --line-strong:#39414e;
+  --accent:#5aa9f5; --accent-soft:#152436;
+  --warn:#e0a458; --warn-soft:#2a2114;
+  --ok:#5cc98a; --ok-soft:#132419;
+  --bad:#f08074; --bad-soft:#2b1614;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth; scroll-padding-top:70px}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  font-size:16.5px; line-height:1.75; -webkit-font-smoothing:antialiased;
+}
+
+/* ---------- top bar ---------- */
+#topbar{
+  position:fixed; top:0; left:0; right:0; height:52px; z-index:50;
+  background:color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter:saturate(180%) blur(12px);
+  border-bottom:1px solid var(--line);
+  display:flex; align-items:center; gap:14px; padding:0 18px;
+}
+#topbar .brand{font-weight:700; font-size:14.5px; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#topbar .brand span{color:var(--accent)}
+#topbar .spacer{flex:1}
+#topbar button{
+  border:1px solid var(--line-strong); background:var(--bg-soft); color:var(--fg-soft);
+  border-radius:8px; height:32px; padding:0 12px; font-size:13px; cursor:pointer; font-family:inherit;
+}
+#topbar button:hover{border-color:var(--accent); color:var(--accent)}
+#progress{position:fixed; top:52px; left:0; height:2px; background:var(--accent); width:0; z-index:51; transition:width .1s linear}
+
+/* ---------- layout ---------- */
+#shell{display:flex; justify-content:center; gap:44px; padding:86px 24px 120px}
+#toc{
+  width:246px; flex:0 0 246px; position:sticky; top:86px; align-self:flex-start;
+  max-height:calc(100vh - 120px); overflow:auto; font-size:13.5px; line-height:1.5;
+}
+#toc .toc-title{font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--fg-faint); font-weight:700; margin-bottom:12px}
+#toc a{display:block; padding:6px 12px; color:var(--fg-soft); text-decoration:none; border-left:2px solid var(--line); margin-left:2px}
+#toc a:hover{color:var(--accent); background:var(--bg-soft)}
+#toc a.active{color:var(--accent); border-left-color:var(--accent); font-weight:600; background:var(--accent-soft)}
+#toc a.sub{padding-left:24px; font-size:12.5px; color:var(--fg-faint)}
+main{max-width:var(--maxw); width:100%; min-width:0}
+@media(max-width:1140px){ #toc{display:none} #shell{padding:78px 20px 90px} }
+
+/* ---------- hero ---------- */
+.hero{margin-bottom:48px; padding-bottom:34px; border-bottom:1px solid var(--line)}
+.kicker{
+  display:inline-block; font-size:11.5px; font-weight:700; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--accent); background:var(--accent-soft); padding:5px 11px; border-radius:999px; margin-bottom:20px;
+}
+h1{font-size:41px; line-height:1.18; margin:0 0 20px; letter-spacing:-.7px; font-weight:750}
+.lede{font-size:18px; color:var(--fg-soft); line-height:1.72; margin:0 0 16px}
+.hero-meta{font-size:13px; color:var(--fg-faint); display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:24px}
+.hero-meta a{color:var(--fg-faint)}
+
+/* ---------- typography ---------- */
+h2{
+  font-size:27px; line-height:1.28; margin:64px 0 20px; font-weight:720; letter-spacing:-.4px;
+  padding-top:14px; border-top:1px solid var(--line); scroll-margin-top:70px;
+}
+h2 .num{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:10px}
+h3{font-size:18.5px; margin:36px 0 12px; font-weight:650; letter-spacing:-.1px; scroll-margin-top:70px}
+p{margin:0 0 16px}
+a{color:var(--accent); text-decoration:none; border-bottom:1px solid color-mix(in srgb, var(--accent) 30%, transparent)}
+a:hover{border-bottom-color:var(--accent)}
+strong{font-weight:670; color:var(--fg)}
+ul,ol{margin:0 0 16px; padding-left:24px}
+li{margin-bottom:7px}
+.small{font-size:14px; color:var(--fg-soft)}
+.muted{color:var(--fg-faint)}
+.ref{font-size:13.5px; color:var(--fg-faint)}
+.pending{border-bottom:1px dotted var(--line-strong); color:var(--fg-faint); cursor:help}
+
+/* ---------- callouts ---------- */
+.callout{border-radius:10px; padding:16px 20px; margin:24px 0; border:1px solid var(--line); background:var(--bg-soft); font-size:15.5px}
+.callout p:last-child,.callout ul:last-child,.callout ol:last-child{margin-bottom:0}
+.callout .label{display:block; font-size:11px; font-weight:750; letter-spacing:.13em; text-transform:uppercase; margin-bottom:8px; color:var(--fg-faint)}
+.callout.q{background:var(--bad-soft); border-color:color-mix(in srgb,var(--bad) 28%,transparent)}
+.callout.q .label{color:var(--bad)}
+.callout.a{background:var(--ok-soft); border-color:color-mix(in srgb,var(--ok) 28%,transparent)}
+.callout.a .label{color:var(--ok)}
+.callout.warn{background:var(--warn-soft); border-color:color-mix(in srgb,var(--warn) 30%,transparent)}
+.callout.warn .label{color:var(--warn)}
+.callout.key{background:var(--accent-soft); border-color:color-mix(in srgb,var(--accent) 28%,transparent)}
+.callout.key .label{color:var(--accent)}
+blockquote{margin:24px 0; padding:14px 22px; border-left:3px solid var(--accent); background:var(--accent-soft); border-radius:0 8px 8px 0; font-size:16.5px}
+blockquote p{margin:0}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto; margin:24px 0}
+table{border-collapse:collapse; width:100%; font-size:14.5px}
+th,td{padding:9px 14px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top}
+thead th{background:var(--bg-soft); font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--fg-soft); border-bottom:1.5px solid var(--line-strong)}
+tbody tr:last-child td{border-bottom:1px solid var(--line-strong)}
+td.n,th.n{text-align:right; font-variant-numeric:tabular-nums}
+table.ledger tbody tr:last-child{background:var(--ok-soft); font-weight:600}
+
+/* ---------- stat cards ---------- */
+.stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:14px; margin:26px 0}
+.stat{border:1px solid var(--line); border-radius:10px; padding:16px 18px; background:var(--bg-soft)}
+.stat .v{font-size:25px; font-weight:750; letter-spacing:-.5px; font-variant-numeric:tabular-nums; color:var(--accent); line-height:1.2}
+.stat .k{font-size:12.5px; color:var(--fg-soft); margin-top:6px; line-height:1.45}
+
+/* ---------- MathML ---------- */
+/* CRITICAL: never set the `display` property on <math> or on MathML children.
+   MathML Core elements compute to `display: block math` / `inline math`, and the
+   `math` inner-display type is what triggers math layout. Overriding it with a
+   plain `display:block` or `inline-block` switches the inner type to `flow`, so
+   every child becomes a stacked block box and the formula renders as a vertical
+   column with one full-width fraction rule. Size and align it instead. */
+math{
+  font-family:"Latin Modern Math","STIX Two Math","XITS Math","Cambria Math","DejaVu Math TeX Gyre","Times New Roman",serif;
+  font-size:1.06em; line-height:normal;
+}
+math[display="block"]{margin-inline:auto; width:fit-content; max-width:100%}
+.math-display{margin:22px 0; overflow-x:auto; overflow-y:hidden}
+.math-display math{font-size:1.18em}
+mtext{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",Roboto,Arial,sans-serif; font-size:.92em}
+.mml-fn{font-style:normal}
+.mml-boxed{border:1.5px solid var(--accent); border-radius:8px; padding:.4em .75em}
+.mml-op{font-size:1.12em}
+html.no-mathml .math-display, html.no-mathml .math-inline{
+  font-family:"SF Mono",SFMono-Regular,Menlo,Consolas,monospace; font-size:14px;
+  background:var(--bg-code); padding:2px 6px; border-radius:5px; color:var(--fg-soft);
+}
+html.no-mathml .math-display{display:block; padding:12px 16px; text-align:left; white-space:pre-wrap}
+code{font-family:"SF Mono",SFMono-Regular,Menlo,Consolas,monospace; font-size:.88em; background:var(--bg-code); padding:2px 6px; border-radius:5px}
+
+/* ---------- figure ---------- */
+figure{margin:32px 0; padding:0}
+figure svg{width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:10px; background:var(--bg-soft)}
+figcaption{font-size:13px; color:var(--fg-faint); margin-top:12px; line-height:1.6}
+.svg-hbm{fill:var(--bg-code); stroke:var(--line-strong)}
+.svg-chip{fill:var(--accent-soft); stroke:var(--accent)}
+.svg-bad{fill:var(--bad-soft); stroke:var(--bad)}
+.svg-loop{fill:none; stroke:var(--ok); stroke-dasharray:7 5}
+.svg-t{fill:var(--fg); font-size:12.5px; font-family:inherit}
+.svg-ts{fill:var(--fg-soft); font-size:11px; font-family:inherit}
+.svg-th{fill:var(--fg); font-size:14.5px; font-weight:700; font-family:inherit}
+.svg-ar{stroke:var(--accent); stroke-width:1.6; fill:none}
+.svg-ar-bad{stroke:var(--bad); stroke-width:1.8; fill:none}
+.svg-ar-loop{stroke:var(--ok); stroke-width:1.6; fill:none; stroke-dasharray:6 4}
+
+/* ---------- checklist / route ---------- */
+ol.check{counter-reset:c; list-style:none; padding-left:0}
+ol.check li{counter-increment:c; position:relative; padding-left:38px; margin-bottom:11px}
+ol.check li::before{
+  content:counter(c); position:absolute; left:0; top:3px; width:24px; height:24px; border-radius:50%;
+  background:var(--accent-soft); color:var(--accent); font-size:12.5px; font-weight:700;
+  display:flex; align-items:center; justify-content:center;
+}
+.route{margin:26px 0; border:1px solid var(--line); border-radius:10px; overflow:hidden}
+.route a{display:flex; gap:14px; align-items:baseline; padding:11px 18px; border-bottom:1px solid var(--line); color:var(--fg); text-decoration:none; border-left:0; font-size:15px}
+.route a:last-child{border-bottom:0}
+.route a:hover{background:var(--accent-soft)}
+.route .i{color:var(--accent); font-weight:750; font-variant-numeric:tabular-nums; flex:0 0 18px}
+
+footer{max-width:var(--maxw); margin:0 auto; padding:0 24px 60px; font-size:13px; color:var(--fg-faint); text-align:center}
+
+@media print{
+  #topbar,#toc,#progress{display:none}
+  #shell{padding:0; display:block}
+  body{font-size:10.5pt}
+  h2{page-break-after:avoid} .callout,figure,.tw,.math-display{page-break-inside:avoid}
+  a{color:inherit}
+}
+@media(max-width:640px){ h1{font-size:29px} h2{font-size:22px} #shell{padding:74px 16px 70px} }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="brand">Flash<span>Attention</span> · from a data-movement problem to the solution</div>
+  <div class="spacer"></div>
+  <button id="themeBtn" title="Toggle theme">◐ Theme</button>
+  <button onclick="window.print()" title="Print / export PDF">⎙ Print</button>
+</div>
+<div id="progress"></div>
+
+<div id="shell">
+<nav id="toc">
+  <div class="toc-title">Reading route</div>
+  <a href="#standard">1 · Why the intermediates are worth optimizing</a>
+  <a href="#tiling">2 · Compute a block, use a block — softmax blocks us</a>
+  <a href="#algebra">3 · Accumulate numerator and denominator</a>
+  <a href="#stable">4 · Exponentials overflow: subtract the max</a>
+  <a href="#online">5 · The max changed: rescale</a>
+  <a href="#memory">6 · Back to the GPU: less data movement</a>
+  <a href="#matrices">7 · Vectors, many queries, Q blocks</a>
+  <a href="#cpu">8 · CPU comparison: tiling vs. fusion</a>
+  <a href="#practice">9 · Problems and solutions, side by side</a>
+  <a href="#backward" class="sub">Appendix · What about the backward pass?</a>
+  <a href="#references" class="sub">Scope and references</a>
+</nav>
+
+<main>
+
+<header class="hero">
+  <div class="kicker">Deep dive · one sample / one head / no mask</div>
+  <h1>FlashAttention: from a data-movement problem, step by step to the solution</h1>
+  <p class="lede">The attention formula is already perfectly clear. So why do we need FlashAttention at all?</p>
+  <p class="lede">This article follows a single question all the way down: <strong>in the end we only need the output — so why write a huge intermediate matrix into device memory just to read it back? Can we compute one block and use it immediately?</strong></p>
+  <p class="small">Every time we hit an obstacle, we first make it concrete with numbers, then introduce the math that removes it. The main text contains only prose, formulas, worked examples done by hand, and diagrams — no code and no commands. We start with a single sample, a single head, no mask and no dropout, full-sequence forward pass; edge cases and advanced material come at the end.</p>
+  <div class="hero-meta">
+    <span>Format: single-page article</span>
+    <span>Reading time: ~25 min</span>
+  </div>
+</header>
+
+<div class="route">
+  <a href="#standard"><span class="i">1</span><span>The problem: why are attention's intermediate results worth optimizing?</span></a>
+  <a href="#tiling"><span class="i">2</span><span>The intuitive approach: compute a block, use a block — why does softmax block us?</span></a>
+  <a href="#algebra"><span class="i">3</span><span>First solution: the final probabilities are unknown, but numerator and denominator can still accumulate</span></a>
+  <a href="#stable"><span class="i">4</span><span>A new problem: the exponentials are too large — why does subtracting the max not change the result?</span></a>
+  <a href="#online"><span class="i">5</span><span>A new obstacle: the maximum changed — what happens to the old accumulators?</span></a>
+  <a href="#memory"><span class="i">6</span><span>Back to the GPU: how does this math reduce data movement?</span></a>
+  <a href="#matrices"><span class="i">7</span><span>From hand arithmetic to real matrices: vectors, many queries, and Q blocks</span></a>
+  <a href="#cpu"><span class="i">8</span><span>A CPU comparison: matmul tiling vs. fusing the whole attention</span></a>
+  <a href="#practice"><span class="i">9</span><span>Putting the problems and the solutions side by side</span></a>
+</div>
+<p class="small muted">Appendix: <a href="#backward">Without storing the probability matrix, how does backpropagation work?</a> · <a href="#references">Scope and references</a></p>
+
+<h2 id="standard"><span class="num">1</span>The problem: why are attention's intermediate results worth optimizing?</h2>
+
+<h3>1.1 First, what is the task?</h3>
+<p>For a single query, attention assigns weights to the corresponding values according to how relevant that query is to each key, and then aggregates the information. Handling many queries together, we write:</p>
+<div class="math-display" data-tex="S=\frac{QK^\top}{\sqrt d},\qquad P=\mathrm{softmax}(S),\qquad O=PV."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>S</mi><mo>=</mo><mfrac><mrow><mi>Q</mi><msup><mi>K</mi><mrow><mo>⊤</mo></mrow></msup></mrow><mrow><msqrt><mi>d</mi></msqrt></mrow></mfrac><mo separator="true">,</mo><mspace width="2em"></mspace><mi>P</mi><mo>=</mo><mtext>softmax</mtext><mo stretchy="false">(</mo><mi>S</mi><mo stretchy="false">)</mo><mo separator="true">,</mo><mspace width="2em"></mspace><mi>O</mi><mo>=</mo><mi>P</mi><mi>V</mi><mo separator="true">.</mo></math></div>
+<p>Forget the derivation for a moment and just look at what gets passed between the three steps:</p>
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>What it produces</th><th>Who needs it next</th></tr></thead>
+<tbody>
+<tr><td>Q against K, relevance</td><td>Score matrix S</td><td>Softmax</td></tr>
+<tr><td>Scores turned into probabilities</td><td>Probability matrix P</td><td>The multiplication with V</td></tr>
+<tr><td>Weight V by the probabilities</td><td>Final output O</td><td>Later network layers</td></tr>
+</tbody></table></div>
+<p>Each row of Q, K and V is one query, key and value respectively; <span class="math-inline" data-tex="K^\top"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>K</mi><mrow><mo>⊤</mo></mrow></msup></math></span> is the transpose of K, and <span class="math-inline" data-tex="d"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>d</mi></math></span> is the length of a query/key vector. Softmax acts on each row of S separately.</p>
+<div class="callout key"><span class="label">The point</span><p>What we ultimately need is <strong>O</strong>. S and P are <strong>intermediate results</strong> produced only in order to get O.</p></div>
+
+<h3>1.2 How big are those intermediates?</h3>
+<p>Suppose there are 4,096 queries and each query looks at 4,096 keys. Then S and P each hold</p>
+<div class="math-display" data-tex="4096\times4096=16\,777\,216"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mn>4096</mn><mo>×</mo><mn>4096</mn><mo>=</mo><mn>16</mn><mspace width="0.17em"></mspace><mn>777</mn><mspace width="0.17em"></mspace><mn>216</mn></math></div>
+<p>elements. At 2 bytes per element, one matrix takes</p>
+<div class="math-display" data-tex="4096^2\times2\div1024^2=32\ \text{MiB}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msup><mn>4096</mn><mrow><mn>2</mn></mrow></msup><mo>×</mo><mn>2</mn><mo>÷</mo><msup><mn>1024</mn><mrow><mn>2</mn></mrow></msup><mo>=</mo><mn>32</mn><mspace width="0.25em"></mspace><mtext>MiB</mtext><mo separator="true">.</mo></math></div>
+<div class="stats">
+  <div class="stat"><div class="v">16,777,216</div><div class="k">elements in one matrix (4096²)</div></div>
+  <div class="stat"><div class="v">32 MiB</div><div class="k">S alone, or P alone (fp16)</div></div>
+  <div class="stat"><div class="v">64 MiB</div><div class="k">S + P together</div></div>
+  <div class="stat"><div class="v">×1</div><div class="k">and that is one head of one sample</div></div>
+</div>
+<p>S and P together come to 64 MiB — and that is still only <em>one head of one sample</em>, and does not include Q, K, V or O. <span class="muted">This is a capacity budget for explicitly storing two matrices; it is not the actual peak memory of every implementation, and certainly not a runtime estimate.</span></p>
+
+<h3>1.3 The problem is not only space — the data has to be moved</h3>
+<p>In one common unfused implementation:</p>
+<ol class="check">
+<li>A matmul computes S and writes it into <strong>HBM</strong>, the GPU's large-capacity device memory.</li>
+<li>Softmax reads S back out, computes P, and writes P back into memory.</li>
+<li>A later matmul reads P out again, multiplies it with V, and produces O.</li>
+</ol>
+<p>Time is not spent only on multiplies and adds — it is also spent reading and writing the data those operations need. A core goal of FlashAttention is to avoid shuttling the full attention intermediates back and forth between HBM and on-chip storage. <span class="ref"><a href="https://arxiv.org/pdf/2205.14135">FlashAttention paper §1–3</a></span></p>
+<div class="callout q"><span class="label">The real question</span><p>The scores still have to be computed. But <strong>do they have to be stored in full before we can move on to the next step?</strong></p></div>
+
+<h2 id="tiling"><span class="num">2</span>The intuitive approach: compute a block, use a block — why does softmax block us?</h2>
+
+<h3>2.1 A natural idea</h3>
+<p>Each round, compute only a small block of scores; immediately turn them into weights, weight the corresponding V, and accumulate into the output. Once that block is done, reuse the same scratch space for the next one.</p>
+<p>Then the small intermediates have a chance to stay in the GPU's on-chip storage, instead of writing full S and P out to device memory.</p>
+<div class="callout warn"><span class="label">Obstacle</span><p><strong>Having computed this block's scores does not mean this block's final probabilities are determined.</strong></p></div>
+
+<h3>2.2 State the softmax formula in full</h3>
+<p>For a row of scores <span class="math-inline" data-tex="[s_1,s_2,\ldots,s_N]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><msub><mi>s</mi><mrow><mn>1</mn></mrow></msub><mo separator="true">,</mo><msub><mi>s</mi><mrow><mn>2</mn></mrow></msub><mo separator="true">,</mo><mo>…</mo><mo separator="true">,</mo><msub><mi>s</mi><mrow><mi>N</mi></mrow></msub><mo stretchy="false">]</mo></math></span>, the probability at position j is</p>
+<div class="math-display" data-tex="p_j=\frac{e^{s_j}}{\sum_{k=1}^{N}e^{s_k}}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>p</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></mrow><mrow><munderover><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>k</mi><mo>=</mo><mn>1</mn></mrow><mrow><mi>N</mi></mrow></munderover><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>k</mi></mrow></msub></mrow></msup></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>The numerator is that position's own exponential weight; the denominator is the total exponential weight of the whole row. <span class="math-inline" data-tex="\sum"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo class="mml-op" movablelimits="false">∑</mo></math></span> simply means "add these terms up".</p>
+<p>Real implementations normally use the max-subtracted, numerically stable form:</p>
+<div class="math-display" data-tex="m=\max(s_1,s_2,\ldots,s_N)."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>m</mi><mo>=</mo><mi mathvariant="normal" class="mml-fn">max</mi><mo stretchy="false">(</mo><msub><mi>s</mi><mrow><mn>1</mn></mrow></msub><mo separator="true">,</mo><msub><mi>s</mi><mrow><mn>2</mn></mrow></msub><mo separator="true">,</mo><mo>…</mo><mo separator="true">,</mo><msub><mi>s</mi><mrow><mi>N</mi></mrow></msub><mo stretchy="false">)</mo><mo separator="true">.</mo></math></div>
+<div class="math-display" data-tex="\boxed{p_j=\frac{e^{s_j-m}}{\sum_{k=1}^{N}e^{s_k-m}}}"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow class="mml-boxed"><msub><mi>p</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup></mrow><mrow><munderover><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>k</mi><mo>=</mo><mn>1</mn></mrow><mrow><mi>N</mi></mrow></munderover><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>k</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup></mrow></mfrac></mrow></math></div>
+<p><strong>The max is subtracted before exponentiating, and every score in the row subtracts the same max.</strong> This is mathematically equivalent to the basic definition; <a href="#stable">Section 4</a> explains why, and why it avoids overflow from large positive exponents. Stable softmax was not invented by FlashAttention. <span class="ref"><a href="https://arxiv.org/pdf/1805.02867">Online normalizer paper §2</a></span></p>
+<p>For now, notice the dependency both forms share: <strong>the final probability needs whole-row information</strong>, not just the current token.</p>
+
+<h3>2.3 Four tokens make the obstacle visible</h3>
+<p>To keep the arithmetic doable by hand, let each value be a single number, and take the following exponential weights as given:</p>
+<div class="tw"><table>
+<thead><tr><th>Token</th><th class="n">Exponential weight <span class="math-inline" data-tex="w_j=e^{s_j}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></math></span></th><th class="n">Value <span class="math-inline" data-tex="v_j"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub></math></span></th></tr></thead>
+<tbody>
+<tr><td>A</td><td class="n">2</td><td class="n">10</td></tr>
+<tr><td>B</td><td class="n">1</td><td class="n">20</td></tr>
+<tr><td>C</td><td class="n">4</td><td class="n">30</td></tr>
+<tr><td>D</td><td class="n">1</td><td class="n">40</td></tr>
+</tbody></table></div>
+<p><strong>2, 1, 4, 1 are the weights <em>after</em> exponentiation — not raw scores, and not probabilities.</strong> These numbers are a teaching setup; we will not recompute them from Q/K dot products here.</p>
+<p>Give the row's total weight a name, Z:</p>
+<div class="math-display" data-tex="Z=\sum_jw_j=2+1+4+1=8."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>Z</mi><mo>=</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><mn>2</mn><mo>+</mo><mn>1</mn><mo>+</mo><mn>4</mn><mo>+</mo><mn>1</mn><mo>=</mo><mn>8</mn><mo separator="true">.</mo></math></div>
+<p>So the probabilities for the complete row are</p>
+<div class="math-display" data-tex="[2/8,\;1/8,\;4/8,\;1/8]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo>/</mo><mn>8</mn><mo separator="true">,</mo><mspace width="0.28em"></mspace><mn>1</mn><mo>/</mo><mn>8</mn><mo separator="true">,</mo><mspace width="0.28em"></mspace><mn>4</mn><mo>/</mo><mn>8</mn><mo separator="true">,</mo><mspace width="0.28em"></mspace><mn>1</mn><mo>/</mo><mn>8</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<p>They sum to 1. Z is not a separately chosen constant, and it is not the token count; <strong>Z = 8 is what you get by adding those four exponential weights.</strong></p>
+
+<h3>2.4 Why can't the first block finish its own softmax?</h3>
+<p>Suppose we have read only A and B so far, and see the weights <span class="math-inline" data-tex="[2,1]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo></math></span>.</p>
+<p>If the row contained nothing else, the probabilities would be <span class="math-inline" data-tex="[2/3,1/3]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo>/</mo><mn>3</mn><mo separator="true">,</mo><mn>1</mn><mo>/</mo><mn>3</mn><mo stretchy="false">]</mo></math></span>. But C and D follow with weights <span class="math-inline" data-tex="[4,1]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>4</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo></math></span>, so A and B should really end up as <span class="math-inline" data-tex="[2/8,1/8]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo>/</mo><mn>8</mn><mo separator="true">,</mo><mn>1</mn><mo>/</mo><mn>8</mn><mo stretchy="false">]</mo></math></span>.</p>
+<p>Same two scores — and the share they deserve changed, purely because more data comes later.</p>
+<p>So we cannot take each block's locally-normalized probabilities and use them as whole-row probabilities. The stable form does not remove the dependency either: the first block knows neither the final maximum nor the final exponential sum.</p>
+<blockquote><p><strong>To cut intermediate storage we want to compute as we read; but the final probabilities depend on data we have not read yet. What now?</strong></p></blockquote>
+
+<h2 id="algebra"><span class="num">3</span>First solution: the final probabilities are unknown, but numerator and denominator can still accumulate</h2>
+
+<h3>3.1 Which part has to wait, and which part can be computed now?</h3>
+<p>A's contribution to the final output is</p>
+<div class="math-display" data-tex="\frac{2}{Z}\times10."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mrow><mn>2</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo>×</mo><mn>10</mn><mo separator="true">.</mo></math></div>
+<p>We do not know Z yet, so we cannot pin down the final contribution. But <span class="math-inline" data-tex="2\times10=20"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>2</mn><mo>×</mo><mn>10</mn><mo>=</mo><mn>20</mn></math></span> can already be computed, because</p>
+<div class="math-display" data-tex="\begin{aligned}
+\frac{2}{Z}\times10
+&amp;=\left(2\times\frac1Z\right)\times10 &amp;&amp;\text{division rewritten as multiplication by the reciprocal}\\
+&amp;=\frac1Z\times(2\times10) &amp;&amp;\text{commutativity and associativity of scalar multiplication}\\
+&amp;=\frac{20}{Z}.
+\end{aligned}"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mtable columnalign="right left right left" columnspacing="0 0.8em 0" rowspacing="0.35em"><mtr><mtd><mfrac><mrow><mn>2</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo>×</mo><mn>10</mn></mtd><mtd><mo>=</mo><mrow><mo stretchy="true">(</mo><mn>2</mn><mo>×</mo><mfrac><mrow><mn>1</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo stretchy="true">)</mo></mrow><mo>×</mo><mn>10</mn></mtd><mtd><mrow></mrow></mtd><mtd><mtext>division rewritten as multiplication by the reciprocal</mtext></mtd></mtr><mtr><mtd><mrow></mrow></mtd><mtd><mo>=</mo><mfrac><mrow><mn>1</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo>×</mo><mo stretchy="false">(</mo><mn>2</mn><mo>×</mo><mn>10</mn><mo stretchy="false">)</mo></mtd><mtd><mrow></mrow></mtd><mtd><mtext>commutativity and associativity of scalar multiplication</mtext></mtd></mtr><mtr><mtd><mrow></mrow></mtd><mtd><mo>=</mo><mfrac><mrow><mn>20</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo separator="true">.</mo></mtd><mtd></mtd><mtd></mtd></mtr></mtable></math></div>
+<p>Here <span class="math-inline" data-tex="Z&gt;0"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>Z</mi><mo>&gt;</mo><mn>0</mn></math></span>, because the weights are all positive. Commutativity lets us swap scalar factors; associativity lets us move the parentheses.</p>
+<div class="callout a"><span class="label">Solution</span><p><strong>What must wait is the final division — not the multiplications that come before it.</strong></p></div>
+
+<h3>3.2 Why can every division be deferred to the end?</h3>
+<p>Rewrite each token the same way:</p>
+<div class="math-display" data-tex="O=\frac{2\times10}{Z}+\frac{1\times20}{Z}+\frac{4\times30}{Z}+\frac{1\times40}{Z}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>O</mi><mo>=</mo><mfrac><mrow><mn>2</mn><mo>×</mo><mn>10</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo>+</mo><mfrac><mrow><mn>1</mn><mo>×</mo><mn>20</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo>+</mo><mfrac><mrow><mn>4</mn><mo>×</mo><mn>30</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo>+</mo><mfrac><mrow><mn>1</mn><mo>×</mo><mn>40</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>Every term carries the same factor <span class="math-inline" data-tex="1/Z"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>/</mo><mi>Z</mi></math></span>, so by distributivity <span class="math-inline" data-tex="cx+cy=c(x+y)"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>c</mi><mi>x</mi><mo>+</mo><mi>c</mi><mi>y</mi><mo>=</mo><mi>c</mi><mo stretchy="false">(</mo><mi>x</mi><mo>+</mo><mi>y</mi><mo stretchy="false">)</mo></math></span>:</p>
+<div class="math-display" data-tex="O=\frac{2\times10+1\times20+4\times30+1\times40}{Z}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>O</mi><mo>=</mo><mfrac><mrow><mn>2</mn><mo>×</mo><mn>10</mn><mo>+</mo><mn>1</mn><mo>×</mo><mn>20</mn><mo>+</mo><mn>4</mn><mo>×</mo><mn>30</mn><mo>+</mo><mn>1</mn><mo>×</mo><mn>40</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>Name the numerator total U:</p>
+<div class="math-display" data-tex="U=\sum_jw_jv_j,\qquad Z=\sum_jw_j,\qquad O=\frac UZ."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>U</mi><mo>=</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub><mo separator="true">,</mo><mspace width="2em"></mspace><mi>Z</mi><mo>=</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><mo separator="true">,</mo><mspace width="2em"></mspace><mi>O</mi><mo>=</mo><mfrac><mrow><mi>U</mi></mrow><mrow><mi>Z</mi></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>This is not a new definition of attention — it is an equivalent way of writing the same weighted average. In general:</p>
+<div class="math-display" data-tex="\sum_j\frac{w_j}{Z}v_j=\frac1Z\sum_jw_jv_j=\frac{\sum_jw_jv_j}{\sum_jw_j}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><mfrac><mrow><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub></mrow><mrow><mi>Z</mi></mrow></mfrac><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><mfrac><mrow><mn>1</mn></mrow><mrow><mi>Z</mi></mrow></mfrac><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><mfrac><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub></mrow><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>The condition that matters is: <strong>for one query, all these terms share the same non-zero denominator.</strong></p>
+
+<h3>3.3 Now we can tile</h3>
+<p>First block, A and B:</p>
+<div class="math-display" data-tex="Z_1=2+1=3,\qquad U_1=2\times10+1\times20=40."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>Z</mi><mrow><mn>1</mn></mrow></msub><mo>=</mo><mn>2</mn><mo>+</mo><mn>1</mn><mo>=</mo><mn>3</mn><mo separator="true">,</mo><mspace width="2em"></mspace><msub><mi>U</mi><mrow><mn>1</mn></mrow></msub><mo>=</mo><mn>2</mn><mo>×</mo><mn>10</mn><mo>+</mo><mn>1</mn><mo>×</mo><mn>20</mn><mo>=</mo><mn>40</mn><mo separator="true">.</mo></math></div>
+<p>We do <em>not</em> treat <span class="math-inline" data-tex="40/3"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>40</mn><mo>/</mo><mn>3</mn></math></span> as an output. We keep two running numbers: 3 and 40.</p>
+<p>The second block, C and D, brings</p>
+<div class="math-display" data-tex="Z_2=4+1=5,\qquad U_2=4\times30+1\times40=160."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>Z</mi><mrow><mn>2</mn></mrow></msub><mo>=</mo><mn>4</mn><mo>+</mo><mn>1</mn><mo>=</mo><mn>5</mn><mo separator="true">,</mo><mspace width="2em"></mspace><msub><mi>U</mi><mrow><mn>2</mn></mrow></msub><mo>=</mo><mn>4</mn><mo>×</mo><mn>30</mn><mo>+</mo><mn>1</mn><mo>×</mo><mn>40</mn><mo>=</mo><mn>160</mn><mo separator="true">.</mo></math></div>
+<p>Fold the new contributions in:</p>
+<div class="tw"><table class="ledger">
+<thead><tr><th>Progress</th><th class="n">Accumulated weight Z</th><th class="n">Accumulated weighted total U</th></tr></thead>
+<tbody>
+<tr><td>after block 1</td><td class="n">3</td><td class="n">40</td></tr>
+<tr><td>after block 2</td><td class="n"><span class="math-inline" data-tex="3+5=8"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>3</mn><mo>+</mo><mn>5</mn><mo>=</mo><mn>8</mn></math></span></td><td class="n"><span class="math-inline" data-tex="40+160=200"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>40</mn><mo>+</mo><mn>160</mn><mo>=</mo><mn>200</mn></math></span></td></tr>
+</tbody></table></div>
+<p>Everything read, divide once at the end:</p>
+<div class="math-display" data-tex="O=\frac{200}{8}=25."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>O</mi><mo>=</mo><mfrac><mrow><mn>200</mn></mrow><mrow><mn>8</mn></mrow></mfrac><mo>=</mo><mn>25</mn><mo separator="true">.</mo></math></div>
+<p>This uses associativity of addition:</p>
+<div class="math-display" data-tex="(a+b)+c=a+(b+c)."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">(</mo><mi>a</mi><mo>+</mo><mi>b</mi><mo stretchy="false">)</mo><mo>+</mo><mi>c</mi><mo>=</mo><mi>a</mi><mo>+</mo><mo stretchy="false">(</mo><mi>b</mi><mo>+</mo><mi>c</mi><mo stretchy="false">)</mo><mo separator="true">.</mo></math></div>
+<p>For example the numerator goes from <span class="math-inline" data-tex="20+20+120+40"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>20</mn><mo>+</mo><mn>20</mn><mo>+</mo><mn>120</mn><mo>+</mo><mn>40</mn></math></span> to <span class="math-inline" data-tex="(20+20)+(120+40)"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">(</mo><mn>20</mn><mo>+</mo><mn>20</mn><mo stretchy="false">)</mo><mo>+</mo><mo stretchy="false">(</mo><mn>120</mn><mo>+</mo><mn>40</mn><mo stretchy="false">)</mo></math></span> — only the grouping changed; nothing was dropped or double-counted.</p>
+
+<h3>3.4 Why can we throw away the first block's temporary weights?</h3>
+<p>A and B's influence on the final output is already folded into U and Z. Later data only adds new contributions; we never need to recall A's and B's individual weights in order to update those two totals.</p>
+<p>Even when later data makes the final denominator larger, the earlier numerator contribution of 40 remains valid. <strong>We never divided by a local denominator too early, so there are no local probabilities to fix up.</strong></p>
+<div class="callout warn"><span class="label">Counterexample</span>
+<p>What we must <em>not</em> do is keep only each block's own average. Block one gives <span class="math-inline" data-tex="40/3"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>40</mn><mo>/</mo><mn>3</mn></math></span>, block two gives <span class="math-inline" data-tex="160/5=32"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>160</mn><mo>/</mo><mn>5</mn><mo>=</mo><mn>32</mn></math></span>; averaging those directly gives</p>
+<div class="math-display" data-tex="\frac{40/3+32}{2}=\frac{68}{3}\approx22.67,"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mrow><mn>40</mn><mo>/</mo><mn>3</mn><mo>+</mo><mn>32</mn></mrow><mrow><mn>2</mn></mrow></mfrac><mo>=</mo><mfrac><mrow><mn>68</mn></mrow><mrow><mn>3</mn></mrow></mfrac><mo>≈</mo><mn>22.67</mn><mo separator="true">,</mo></math></div>
+<p>not 25. The two blocks carry total weights 3 and 5 — they were never entitled to half each. The correct weighting is</p>
+<div class="math-display" data-tex="\frac38\cdot\frac{40}{3}+\frac58\cdot\frac{160}{5}=25."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mrow><mn>38</mn></mrow><mrow><mo>⋅</mo></mrow></mfrac><mfrac><mrow><mn>40</mn></mrow><mrow><mn>3</mn></mrow></mfrac><mo>+</mo><mfrac><mrow><mn>58</mn></mrow><mrow><mo>⋅</mo></mrow></mfrac><mfrac><mrow><mn>160</mn></mrow><mrow><mn>5</mn></mrow></mfrac><mo>=</mo><mn>25</mn><mo separator="true">.</mo></math></div>
+</div>
+
+<h3>3.5 What role does commutativity actually play?</h3>
+<p>Commutativity of addition, <span class="math-inline" data-tex="a+b=b+a"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>a</mi><mo>+</mo><mi>b</mi><mo>=</mo><mi>b</mi><mo>+</mo><mi>a</mi></math></span>, additionally lets us reorder the summation — for instance handling C and D before A and B.</p>
+<p>But what moves together is the <strong>pair</strong> of weight and value: <span class="math-inline" data-tex="4\times30"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>4</mn><mo>×</mo><mn>30</mn></math></span> must not turn into <span class="math-inline" data-tex="4\times10"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>4</mn><mo>×</mo><mn>10</mn></math></span> because a weight moved. For a fixed query, the set of visible tokens taking part must also stay the same.</p>
+<p>So the three rules each have their own job:</p>
+<ul>
+<li><strong>Distributivity</strong> — pull out the common factor so the division can be deferred.</li>
+<li><strong>Associativity</strong> — accumulate many terms in groups.</li>
+<li><strong>Commutativity</strong> — reorder summands while keeping their pairing intact; sequential tiling does not itself require reordering.</li>
+</ul>
+<p>That removes the obstacle "the final probabilities are unknown, so we cannot continue". But accumulating <span class="math-inline" data-tex="e^{s_j}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></math></span> directly still has a numeric-range problem.</p>
+
+<h2 id="stable"><span class="num">4</span>A new problem: the exponentials are too large — why does subtracting the max not change the result?</h2>
+
+<h3>4.1 The numbers can overflow long before the final division</h3>
+<p>The weights in our example are tiny, but real scores can be large. Computing <span class="math-inline" data-tex="e^{1000}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mn>1000</mn></mrow></msup></math></span> directly in ordinary FP32/FP64, for instance, exceeds the representable range.</p>
+<p>So "accumulate first, divide last" is mathematically sound, yet the machine may still fail at the exponentiation step.</p>
+<div class="callout q"><span class="label">What we need</span><p><strong>Shrink the weights without changing the final output.</strong></p></div>
+
+<h3>4.2 Try it: divide every weight by 4</h3>
+<p>Leave the values alone and turn the exponential weights into</p>
+<div class="math-display" data-tex="[2,1,4,1]/4=[0.5,0.25,1,0.25]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo separator="true">,</mo><mn>1</mn><mo separator="true">,</mo><mn>4</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo><mo>/</mo><mn>4</mn><mo>=</mo><mo stretchy="false">[</mo><mn>0.5</mn><mo separator="true">,</mo><mn>0.25</mn><mo separator="true">,</mo><mn>1</mn><mo separator="true">,</mo><mn>0.25</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<p>The new total weight is</p>
+<div class="math-display" data-tex="0.5+0.25+1+0.25=2."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mn>0.5</mn><mo>+</mo><mn>0.25</mn><mo>+</mo><mn>1</mn><mo>+</mo><mn>0.25</mn><mo>=</mo><mn>2</mn><mo separator="true">.</mo></math></div>
+<p>The new weighted total is</p>
+<div class="math-display" data-tex="0.5\times10+0.25\times20+1\times30+0.25\times40=50."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mn>0.5</mn><mo>×</mo><mn>10</mn><mo>+</mo><mn>0.25</mn><mo>×</mo><mn>20</mn><mo>+</mo><mn>1</mn><mo>×</mo><mn>30</mn><mo>+</mo><mn>0.25</mn><mo>×</mo><mn>40</mn><mo>=</mo><mn>50</mn><mo separator="true">.</mo></math></div>
+<p>And the answer is still <span class="math-inline" data-tex="50/2=25"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>50</mn><mo>/</mo><mn>2</mn><mo>=</mo><mn>25</mn></math></span>.</p>
+<p>Why? Every summand was divided by 4, and distributivity guarantees the total is divided by 4 as well. Numerator and denominator shrank by the same factor:</p>
+<div class="math-display" data-tex="\frac{200/4}{8/4}=\frac{200}{8}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mrow><mn>200</mn><mo>/</mo><mn>4</mn></mrow><mrow><mn>8</mn><mo>/</mo><mn>4</mn></mrow></mfrac><mo>=</mo><mfrac><mrow><mn>200</mn></mrow><mrow><mn>8</mn></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>It does not have to be 4. For any positive number c,</p>
+<div class="math-display" data-tex="\frac{\sum_j(w_j/c)v_j}{\sum_j(w_j/c)}=\frac{U/c}{Z/c}=\frac UZ."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><mo stretchy="false">(</mo><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><mo>/</mo><mi>c</mi><mo stretchy="false">)</mo><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub></mrow><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><mo stretchy="false">(</mo><msub><mi>w</mi><mrow><mi>j</mi></mrow></msub><mo>/</mo><mi>c</mi><mo stretchy="false">)</mo></mrow></mfrac><mo>=</mo><mfrac><mrow><mi>U</mi><mo>/</mo><mi>c</mi></mrow><mrow><mi>Z</mi><mo>/</mo><mi>c</mi></mrow></mfrac><mo>=</mo><mfrac><mrow><mi>U</mi></mrow><mrow><mi>Z</mi></mrow></mfrac><mo separator="true">.</mo></math></div>
+<div class="callout a"><span class="label">Conclusion</span><p><strong>Common scaling does not change the ratios between the weights, and does not change the final probabilities.</strong></p></div>
+
+<h3>4.3 If the exponential already overflowed, is dividing afterwards still in time?</h3>
+<p>No. So the adjustment has to happen <strong>before</strong> exponentiating.</p>
+<p>The tool is the exponent rule:</p>
+<div class="math-display" data-tex="e^{s_j-m}=\frac{e^{s_j}}{e^m}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></mrow><mrow><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup></mrow></mfrac><mo separator="true">.</mo></math></div>
+<p>For a score it reads "subtract the same m"; for an exponential weight it reads "divide by the same <span class="math-inline" data-tex="e^m"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup></math></span>". So we can compute <span class="math-inline" data-tex="e^{s_j-m}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup></math></span> directly, without ever forming the possibly-overflowing <span class="math-inline" data-tex="e^{s_j}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></math></span> or <span class="math-inline" data-tex="e^m"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup></math></span>.</p>
+<p>Expanding the stable formula from Section 2:</p>
+<div class="math-display" data-tex="\begin{aligned}
+\frac{e^{s_j-m}}{\sum_k e^{s_k-m}}
+&amp;=\frac{e^{-m}e^{s_j}}{\sum_k e^{-m}e^{s_k}}\\
+&amp;=\frac{e^{-m}e^{s_j}}{e^{-m}\sum_k e^{s_k}}\\
+&amp;=\frac{e^{s_j}}{\sum_k e^{s_k}}.
+\end{aligned}"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mtable columnalign="right left" columnspacing="0" rowspacing="0.35em"><mtr><mtd><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup></mrow><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>k</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>k</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup></mrow></mfrac></mtd><mtd><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><mo>−</mo><mi>m</mi></mrow></msup><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></mrow><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>k</mi></mrow></munder><msup><mi>e</mi><mrow><mo>−</mo><mi>m</mi></mrow></msup><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>k</mi></mrow></msub></mrow></msup></mrow></mfrac></mtd></mtr><mtr><mtd><mrow></mrow></mtd><mtd><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><mo>−</mo><mi>m</mi></mrow></msup><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></mrow><mrow><msup><mi>e</mi><mrow><mo>−</mo><mi>m</mi></mrow></msup><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>k</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>k</mi></mrow></msub></mrow></msup></mrow></mfrac></mtd></mtr><mtr><mtd><mrow></mrow></mtd><mtd><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></mrow><mrow><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>k</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>k</mi></mrow></msub></mrow></msup></mrow></mfrac><mo separator="true">.</mo></mtd></mtr></mtable></math></div>
+<p>Step one is the exponent rule; step two pulls out the common factor by distributivity; step three cancels a common non-zero factor. <span class="muted">This is an equivalence proof under real arithmetic; it does not require the machine to actually compute those enormous intermediate numbers.</span></p>
+
+<h3>4.4 Why choose the maximum score?</h3>
+<p>For a row of finite scores, choosing <span class="math-inline" data-tex="m=\max_j s_j"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>m</mi><mo>=</mo><munder><mi mathvariant="normal" class="mml-fn">max</mi><mrow><mi>j</mi></mrow></munder><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></math></span> gives</p>
+<div class="math-display" data-tex="s_j-m\leq0,\qquad 0&lt;e^{s_j-m}\leq1."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi><mo>≤</mo><mn>0</mn><mo separator="true">,</mo><mspace width="2em"></mspace><mn>0</mn><mo>&lt;</mo><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup><mo>≤</mo><mn>1</mn><mo separator="true">.</mo></math></div>
+<p>Every new weight is at most 1, and at least one of them equals 1.</p>
+<p>For example, with scores <span class="math-inline" data-tex="[1000,1001]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>1000</mn><mo separator="true">,</mo><mn>1001</mn><mo stretchy="false">]</mo></math></span>, subtract the maximum 1001 to get <span class="math-inline" data-tex="[-1,0]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mo>−</mo><mn>1</mn><mo separator="true">,</mo><mn>0</mn><mo stretchy="false">]</mo></math></span>, then exponentiate to get roughly <span class="math-inline" data-tex="[0.368,1]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>0.368</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo></math></span>. The overflow from large positive exponents is gone. <span class="muted">Floating point still rounds, and extremely small weights may underflow to 0; this is not a claim that all numerical error disappears.</span></p>
+<div class="callout warn"><span class="label">Don't conflate these</span>
+<p>The two "divisions" are not the same operation:</p>
+<ul style="margin-bottom:0">
+<li>Dividing by <strong>Z</strong> normalizes weights into probabilities, which sum to 1.</li>
+<li>Dividing by <span class="math-inline" data-tex="e^m"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup></math></span> moves the weights onto a smaller scale; their sum is <strong>not</strong> required to be 1.</li>
+</ul>
+</div>
+
+<h3>4.5 Wasn't Z equal to 8? Why is the new denominator 2?</h3>
+<p>Because they count weights at different scales:</p>
+<div class="tw"><table>
+<thead><tr><th>Symbol</th><th>Definition</th><th class="n">Value in this example, once everything is processed</th></tr></thead>
+<tbody>
+<tr><td>Z</td><td>total of the raw exponential weights, <span class="math-inline" data-tex="\sum_j e^{s_j}"><math xmlns="http://www.w3.org/1998/Math/MathML"><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup></math></span></td><td class="n">8</td></tr>
+<tr><td>l</td><td>total of the max-subtracted weights, <span class="math-inline" data-tex="\sum_j e^{s_j-m}"><math xmlns="http://www.w3.org/1998/Math/MathML"><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup></math></span></td><td class="n">2</td></tr>
+<tr><td>U</td><td>total weighted result at raw scale, <span class="math-inline" data-tex="\sum_j e^{s_j}v_j"><math xmlns="http://www.w3.org/1998/Math/MathML"><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub></math></span></td><td class="n">200</td></tr>
+<tr><td>a</td><td>total weighted result at the same scaled level, <span class="math-inline" data-tex="\sum_j e^{s_j-m}v_j"><math xmlns="http://www.w3.org/1998/Math/MathML"><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi></mrow></msup><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub></math></span></td><td class="n">50</td></tr>
+</tbody></table></div>
+<p>The exponential grows with the score, so the largest score corresponds to this example's largest exponential weight, 4 — that is, <span class="math-inline" data-tex="e^m=4"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup><mo>=</mo><mn>4</mn></math></span>. Hence <span class="math-inline" data-tex="l=Z/4"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>l</mi><mo>=</mo><mi>Z</mi><mo>/</mo><mn>4</mn></math></span>, <span class="math-inline" data-tex="a=U/4"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>a</mi><mo>=</mo><mi>U</mi><mo>/</mo><mn>4</mn></math></span>, and <span class="math-inline" data-tex="a/l=U/Z=25"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>a</mi><mo>/</mo><mi>l</mi><mo>=</mo><mi>U</mi><mo>/</mo><mi>Z</mi><mo>=</mo><mn>25</mn></math></span>. <strong>The definition of Z did not change; we simply started accumulating the scaled quantities instead.</strong></p>
+<div class="callout q"><span class="label">The next obstacle</span><p>When reading block by block, the first block does not know the row's overall maximum. If a larger score turns up later, what happens to the old l and a?</p></div>
+
+<h2 id="online"><span class="num">5</span>A new obstacle: the maximum changed — what happens to the old accumulators?</h2>
+
+<h3>5.1 The first block uses the maximum it has so far</h3>
+<p>To line up exactly with the weights <span class="math-inline" data-tex="[2,1,4,1]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo separator="true">,</mo><mn>1</mn><mo separator="true">,</mo><mn>4</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo></math></span>, this row of scores is</p>
+<div class="math-display" data-tex="[\ln2,0,\ln4,0]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn><mo separator="true">,</mo><mn>0</mn><mo separator="true">,</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>4</mn><mo separator="true">,</mo><mn>0</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<p><span class="math-inline" data-tex="\ln2"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn></math></span> denotes the number whose exponential is 2, i.e. <span class="math-inline" data-tex="e^{\ln2}=2"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn></mrow></msup><mo>=</mo><mn>2</mn></math></span>; likewise <span class="math-inline" data-tex="e^{\ln4}=4"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi mathvariant="normal" class="mml-fn">ln</mi><mn>4</mn></mrow></msup><mo>=</mo><mn>4</mn></math></span> and <span class="math-inline" data-tex="e^0=1"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mn>0</mn></mrow></msup><mo>=</mo><mn>1</mn></math></span>.</p>
+<p>The first block's scores are <span class="math-inline" data-tex="[\ln2,0]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn><mo separator="true">,</mo><mn>0</mn><mo stretchy="false">]</mo></math></span>, so the current maximum is <span class="math-inline" data-tex="m=\ln2"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>m</mi><mo>=</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn></math></span>. Subtracting m is the same as dividing the weights by <span class="math-inline" data-tex="e^m=2"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup><mo>=</mo><mn>2</mn></math></span>:</p>
+<div class="math-display" data-tex="[2,1]/2=[1,0.5]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo><mo>/</mo><mn>2</mn><mo>=</mo><mo stretchy="false">[</mo><mn>1</mn><mo separator="true">,</mo><mn>0.5</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<p>Now accumulate:</p>
+<div class="math-display" data-tex="l=1+0.5=1.5,\qquad a=1\times10+0.5\times20=20."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>l</mi><mo>=</mo><mn>1</mn><mo>+</mo><mn>0.5</mn><mo>=</mo><mn>1.5</mn><mo separator="true">,</mo><mspace width="2em"></mspace><mi>a</mi><mo>=</mo><mn>1</mn><mo>×</mo><mn>10</mn><mo>+</mo><mn>0.5</mn><mo>×</mo><mn>20</mn><mo>=</mo><mn>20</mn><mo separator="true">.</mo></math></div>
+<p>Three things get remembered: <strong>the current maximum <span class="math-inline" data-tex="\ln2"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn></math></span>, and the two accumulators at that scale, 1.5 and 20.</strong></p>
+
+<h3>5.2 The second block arrives — why can't we simply add?</h3>
+<p>The second block's scores are <span class="math-inline" data-tex="[\ln4,0]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>4</mn><mo separator="true">,</mo><mn>0</mn><mo stretchy="false">]</mo></math></span>, so the maximum rises to <span class="math-inline" data-tex="m&#x27;=\ln4"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>m</mi><mo class="mml-prime">′</mo><mo>=</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>4</mn></math></span>. The new common reference should be "raw weights divided by 4".</p>
+<p>The second block therefore gets the new weights</p>
+<div class="math-display" data-tex="[4,1]/4=[1,0.25]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>4</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo><mo>/</mo><mn>4</mn><mo>=</mo><mo stretchy="false">[</mo><mn>1</mn><mo separator="true">,</mo><mn>0.25</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<p>Mixing those straight into the first block's <span class="math-inline" data-tex="[1,0.5]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>1</mn><mo separator="true">,</mo><mn>0.5</mn><mo stretchy="false">]</mo></math></span> goes wrong:</p>
+<div class="tw"><table>
+<thead><tr><th>Token</th><th class="n">Raw weight</th><th class="n">Scaled by its own block's maximum</th></tr></thead>
+<tbody>
+<tr><td>A, from block 1</td><td class="n">2</td><td class="n"><span class="math-inline" data-tex="2/2=1"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>2</mn><mo>/</mo><mn>2</mn><mo>=</mo><mn>1</mn></math></span></td></tr>
+<tr><td>C, from block 2</td><td class="n">4</td><td class="n"><span class="math-inline" data-tex="4/4=1"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>4</mn><mo>/</mo><mn>4</mn><mo>=</mo><mn>1</mn></math></span></td></tr>
+</tbody></table></div>
+<div class="callout warn"><span class="label">What broke</span><p><strong>C ought to be twice A, and now they are equal.</strong> Block one was divided by 2, block two by 4 — quantities on different scales cannot be merged directly.</p></div>
+
+<h3>5.3 The fix: move the old accumulators onto the "divide by 4" scale</h3>
+<p>Block one was effectively divided by 2; to make it effectively divided by 4, multiply by <span class="math-inline" data-tex="1/2"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>/</mo><mn>2</mn></math></span> once more:</p>
+<div class="math-display" data-tex="\frac{x}{4}=\frac{x}{2}\times\frac12."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mrow><mi>x</mi></mrow><mrow><mn>4</mn></mrow></mfrac><mo>=</mo><mfrac><mrow><mi>x</mi></mrow><mrow><mn>2</mn></mrow></mfrac><mo>×</mo><mfrac><mrow><mn>12</mn></mrow><mrow><mo separator="true">.</mo></mrow></mfrac></math></div>
+<p>But we did not keep the individual old weights — only the totals. What now?</p>
+<p>Multiply the totals by <span class="math-inline" data-tex="1/2"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>/</mo><mn>2</mn></math></span> as well. Distributivity guarantees that scaling a sum is the same as scaling each of its terms:</p>
+<div class="math-display" data-tex="0.5(1\times10+0.5\times20)=(0.5\times1)\times10+(0.5\times0.5)\times20."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mn>0.5</mn><mo stretchy="false">(</mo><mn>1</mn><mo>×</mo><mn>10</mn><mo>+</mo><mn>0.5</mn><mo>×</mo><mn>20</mn><mo stretchy="false">)</mo><mo>=</mo><mo stretchy="false">(</mo><mn>0.5</mn><mo>×</mo><mn>1</mn><mo stretchy="false">)</mo><mo>×</mo><mn>10</mn><mo>+</mo><mo stretchy="false">(</mo><mn>0.5</mn><mo>×</mo><mn>0.5</mn><mo stretchy="false">)</mo><mo>×</mo><mn>20</mn><mo separator="true">.</mo></math></div>
+<p>So</p>
+<div class="math-display" data-tex="l_{\text{old, rescaled}}=1.5\times0.5=0.75,"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>l</mi><mrow><mtext>old, rescaled</mtext></mrow></msub><mo>=</mo><mn>1.5</mn><mo>×</mo><mn>0.5</mn><mo>=</mo><mn>0.75</mn><mo separator="true">,</mo></math></div>
+<div class="math-display" data-tex="a_{\text{old, rescaled}}=20\times0.5=10."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>a</mi><mrow><mtext>old, rescaled</mtext></mrow></msub><mo>=</mo><mn>20</mn><mo>×</mo><mn>0.5</mn><mo>=</mo><mn>10</mn><mo separator="true">.</mo></math></div>
+<div class="callout a"><span class="label">Solution</span><p><strong>No need to go back and recompute block one, and we are not modifying the original V. We are only adjusting the weight scale that the old contributions live on.</strong></p></div>
+
+<h3>5.4 With the scales unified, fold in the new block</h3>
+<p>Block two contributes</p>
+<div class="math-display" data-tex="l_{\text{new}}=1+0.25=1.25,\qquad a_{\text{new}}=1\times30+0.25\times40=40."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>l</mi><mrow><mtext>new</mtext></mrow></msub><mo>=</mo><mn>1</mn><mo>+</mo><mn>0.25</mn><mo>=</mo><mn>1.25</mn><mo separator="true">,</mo><mspace width="2em"></mspace><msub><mi>a</mi><mrow><mtext>new</mtext></mrow></msub><mo>=</mo><mn>1</mn><mo>×</mo><mn>30</mn><mo>+</mo><mn>0.25</mn><mo>×</mo><mn>40</mn><mo>=</mo><mn>40</mn><mo separator="true">.</mo></math></div>
+<p>Add old and new:</p>
+<div class="math-display" data-tex="l&#x27;=0.75+1.25=2,\qquad a&#x27;=10+40=50."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>l</mi><mo class="mml-prime">′</mo><mo>=</mo><mn>0.75</mn><mo>+</mo><mn>1.25</mn><mo>=</mo><mn>2</mn><mo separator="true">,</mo><mspace width="2em"></mspace><mi>a</mi><mo class="mml-prime">′</mo><mo>=</mo><mn>10</mn><mo>+</mo><mn>40</mn><mo>=</mo><mn>50</mn><mo separator="true">.</mo></math></div>
+<p>And the result is still <span class="math-inline" data-tex="O=50/2=25"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>O</mi><mo>=</mo><mn>50</mn><mo>/</mo><mn>2</mn><mo>=</mo><mn>25</mn></math></span>.</p>
+<div class="tw"><table class="ledger">
+<thead><tr><th>Progress</th><th>Scaling reference</th><th class="n">l</th><th class="n">a</th></tr></thead>
+<tbody>
+<tr><td>after block 1</td><td>raw weights ÷ 2</td><td class="n">1.5</td><td class="n">20</td></tr>
+<tr><td>old state rescaled</td><td>raw weights ÷ 4</td><td class="n">0.75</td><td class="n">10</td></tr>
+<tr><td>block 2 folded in</td><td>raw weights ÷ 4</td><td class="n">2</td><td class="n">50</td></tr>
+</tbody></table></div>
+<p><strong>Numerator and denominator have to be adjusted together.</strong> Rescaling only l while leaving the old a at 20 would wrongly give <span class="math-inline" data-tex="(20+40)/2=30"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">(</mo><mn>20</mn><mo>+</mo><mn>40</mn><mo stretchy="false">)</mo><mo>/</mo><mn>2</mn><mo>=</mo><mn>30</mn></math></span>.</p>
+
+<h3>5.5 Where does the general rescale factor come from?</h3>
+<p>The old contributions have already been divided by <span class="math-inline" data-tex="e^m"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup></math></span>; we now want them to be effectively divided by <span class="math-inline" data-tex="e^{m&#x27;}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup></math></span>, so they should be multiplied by</p>
+<div class="math-display" data-tex="\alpha=\frac{e^m}{e^{m&#x27;}}=e^{m-m&#x27;}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>α</mi><mo>=</mo><mfrac><mrow><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup></mrow><mrow><msup><mi>e</mi><mrow><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup></mrow></mfrac><mo>=</mo><msup><mi>e</mi><mrow><mi>m</mi><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup><mo separator="true">.</mo></math></div>
+<p>In this example <span class="math-inline" data-tex="\alpha=e^{\ln2-\ln4}=2/4=0.5"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>α</mi><mo>=</mo><msup><mi>e</mi><mrow><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn><mo>−</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>4</mn></mrow></msup><mo>=</mo><mn>2</mn><mo>/</mo><mn>4</mn><mo>=</mo><mn>0.5</mn></math></span>. In practice we exponentiate the difference directly, rather than forming two possibly huge exponentials and dividing them.</p>
+<p>For any old score,</p>
+<div class="math-display" data-tex="\begin{aligned}
+e^{s-m&#x27;}&amp;=e^{(s-m)+(m-m&#x27;)}\\
+&amp;=e^{s-m}e^{m-m&#x27;}\\
+&amp;=\alpha e^{s-m}.
+\end{aligned}"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mtable columnalign="right left" columnspacing="0" rowspacing="0.35em"><mtr><mtd><msup><mi>e</mi><mrow><mi>s</mi><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup></mtd><mtd><mo>=</mo><msup><mi>e</mi><mrow><mo stretchy="false">(</mo><mi>s</mi><mo>−</mo><mi>m</mi><mo stretchy="false">)</mo><mo>+</mo><mo stretchy="false">(</mo><mi>m</mi><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo><mo stretchy="false">)</mo></mrow></msup></mtd></mtr><mtr><mtd><mrow></mrow></mtd><mtd><mo>=</mo><msup><mi>e</mi><mrow><mi>s</mi><mo>−</mo><mi>m</mi></mrow></msup><msup><mi>e</mi><mrow><mi>m</mi><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup></mtd></mtr><mtr><mtd><mrow></mrow></mtd><mtd><mo>=</mo><mi>α</mi><msup><mi>e</mi><mrow><mi>s</mi><mo>−</mo><mi>m</mi></mrow></msup><mo separator="true">.</mo></mtd></mtr></mtable></math></div>
+<p>Step one adds and subtracts the same m; step two uses <span class="math-inline" data-tex="e^{x+y}=e^xe^y"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>x</mi><mo>+</mo><mi>y</mi></mrow></msup><mo>=</mo><msup><mi>e</mi><mrow><mi>x</mi></mrow></msup><msup><mi>e</mi><mrow><mi>y</mi></mrow></msup></math></span>. Every old term shares the same <span class="math-inline" data-tex="\alpha"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>α</mi></math></span>, so it factors out of the sum, and both the old l and the old a get multiplied by it.</p>
+<p>So for each new block we do:</p>
+<div class="callout key"><span class="label">Online softmax update</span>
+<div class="math-display" data-tex="\begin{aligned}
+m&#x27;&amp;=\max(m,\ \text{block max score}),\\
+\alpha&amp;=e^{m-m&#x27;},\\
+l&#x27;&amp;=\alpha l+\sum_{\text{block}}e^{s_j-m&#x27;},\\
+a&#x27;&amp;=\alpha a+\sum_{\text{block}}e^{s_j-m&#x27;}v_j.
+\end{aligned}"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mtable columnalign="right left" columnspacing="0" rowspacing="0.35em"><mtr><mtd><mi>m</mi><mo class="mml-prime">′</mo></mtd><mtd><mo>=</mo><mi mathvariant="normal" class="mml-fn">max</mi><mo stretchy="false">(</mo><mi>m</mi><mo separator="true">,</mo><mspace width="0.25em"></mspace><mtext>block max score</mtext><mo stretchy="false">)</mo><mo separator="true">,</mo></mtd></mtr><mtr><mtd><mi>α</mi></mtd><mtd><mo>=</mo><msup><mi>e</mi><mrow><mi>m</mi><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup><mo separator="true">,</mo></mtd></mtr><mtr><mtd><mi>l</mi><mo class="mml-prime">′</mo></mtd><mtd><mo>=</mo><mi>α</mi><mi>l</mi><mo>+</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mtext>block</mtext></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup><mo separator="true">,</mo></mtd></mtr><mtr><mtd><mi>a</mi><mo class="mml-prime">′</mo></mtd><mtd><mo>=</mo><mi>α</mi><mi>a</mi><mo>+</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mtext>block</mtext></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup><msub><mi>v</mi><mrow><mi>j</mi></mrow></msub><mo separator="true">.</mo></mtd></mtr></mtable></math></div>
+</div>
+<p>The first block is simply initialized with its own maximum; after that the update repeats, and <span class="math-inline" data-tex="a/l"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>a</mi><mo>/</mo><mi>l</mi></math></span> is computed only at the very end. If the maximum did not change then <span class="math-inline" data-tex="m&#x27;=m"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>m</mi><mo class="mml-prime">′</mo><mo>=</mo><mi>m</mi></math></span>, so <span class="math-inline" data-tex="\alpha=1"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>α</mi><mo>=</mo><mn>1</mn></math></span> and the old scale needs no adjustment at all.</p>
+<p>This is the online softmax we needed: <strong>maintain correct normalization statistics block by block, instead of obtaining each token's final probability up front.</strong> <span class="ref">See <a href="https://arxiv.org/pdf/1805.02867">Online normalizer §3</a> for the algorithm, and <a href="https://tridao.me/publications/flash2/flash2.pdf">FlashAttention-2 §3.1</a> for the accumulate-then-normalize-once formulation.</span></p>
+
+<h2 id="memory"><span class="num">6</span>Back to the GPU: how does this math reduce data movement?</h2>
+
+<h3>6.1 The two dataflows side by side</h3>
+
+<figure>
+<svg viewBox="0 0 980 640" role="img" aria-label="Dataflow comparison: normal attention versus FlashAttention">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+    <marker id="ahl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ok)"/></marker>
+  </defs>
+
+  <line x1="480" y1="16" x2="480" y2="600" stroke="var(--line)" stroke-width="1"/>
+  <text class="svg-th" x="240" y="32" text-anchor="middle">Normal attention (unfused)</text>
+  <text class="svg-th" x="722" y="32" text-anchor="middle">FlashAttention (tiling + online softmax + fusion)</text>
+
+  <!-- LEFT -->
+  <rect class="svg-hbm" x="70" y="52" width="340" height="38" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="240" y="76" text-anchor="middle">HBM (device memory): Q, K, V</text>
+  <line class="svg-ar" x1="240" y1="90" x2="240" y2="104" marker-end="url(#ah)"/>
+
+  <rect class="svg-chip" x="70" y="110" width="340" height="40" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="240" y="135" text-anchor="middle">On-chip compute:  S = QKᵀ / √d</text>
+  <line class="svg-ar-bad" x1="240" y1="150" x2="240" y2="164" marker-end="url(#ahb)"/>
+
+  <rect class="svg-bad" x="70" y="170" width="340" height="46" rx="7" stroke-width="1.4"/>
+  <text class="svg-t" x="240" y="191" text-anchor="middle">Write to HBM: the full S</text>
+  <text class="svg-ts" x="240" y="208" text-anchor="middle">N × N ≈ 32 MiB  (1 sample / 1 head, fp16)</text>
+  <line class="svg-ar-bad" x1="240" y1="216" x2="240" y2="230" marker-end="url(#ahb)"/>
+
+  <rect class="svg-chip" x="70" y="236" width="340" height="40" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="240" y="261" text-anchor="middle">Read S back → softmax → P</text>
+  <line class="svg-ar-bad" x1="240" y1="276" x2="240" y2="290" marker-end="url(#ahb)"/>
+
+  <rect class="svg-bad" x="70" y="296" width="340" height="46" rx="7" stroke-width="1.4"/>
+  <text class="svg-t" x="240" y="317" text-anchor="middle">Write to HBM: the full P</text>
+  <text class="svg-ts" x="240" y="334" text-anchor="middle">N × N ≈ 32 MiB</text>
+  <line class="svg-ar-bad" x1="240" y1="342" x2="240" y2="356" marker-end="url(#ahb)"/>
+
+  <rect class="svg-chip" x="70" y="362" width="340" height="40" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="240" y="387" text-anchor="middle">Read P back, compute O = PV</text>
+  <line class="svg-ar" x1="240" y1="402" x2="240" y2="416" marker-end="url(#ah)"/>
+
+  <rect class="svg-hbm" x="70" y="422" width="340" height="38" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="240" y="446" text-anchor="middle">HBM: O</text>
+
+  <text class="svg-ts" x="240" y="486" text-anchor="middle" style="fill:var(--bad)">full S and full P: each written once, read once</text>
+
+  <!-- RIGHT -->
+  <rect class="svg-hbm" x="546" y="52" width="352" height="38" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="722" y="76" text-anchor="middle">HBM (device memory): Q, K, V</text>
+  <line class="svg-ar" x1="722" y1="90" x2="722" y2="104" marker-end="url(#ah)"/>
+
+  <rect class="svg-chip" x="546" y="110" width="352" height="36" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="722" y="133" text-anchor="middle">Load Q block Qᵢ  (outer loop, stays resident)</text>
+  <line class="svg-ar" x1="722" y1="146" x2="722" y2="182" marker-end="url(#ah)"/>
+
+  <rect class="svg-loop" x="524" y="158" width="404" height="252" rx="10" stroke-width="1.6"/>
+  <text class="svg-ts" x="538" y="176" style="fill:var(--ok); font-weight:700">for each K/V block  j = 1 … T</text>
+
+  <rect class="svg-chip" x="546" y="190" width="336" height="32" rx="6" stroke-width="1.1"/>
+  <text class="svg-t" x="714" y="211" text-anchor="middle">load Kⱼ, Vⱼ on-chip</text>
+  <line class="svg-ar" x1="714" y1="222" x2="714" y2="230" marker-end="url(#ah)"/>
+
+  <rect class="svg-chip" x="546" y="236" width="336" height="32" rx="6" stroke-width="1.1"/>
+  <text class="svg-t" x="714" y="257" text-anchor="middle">Sᵢⱼ = Qᵢ Kⱼᵀ / √d — a tile, never written to HBM</text>
+  <line class="svg-ar" x1="714" y1="268" x2="714" y2="276" marker-end="url(#ah)"/>
+
+  <rect class="svg-chip" x="546" y="282" width="336" height="32" rx="6" stroke-width="1.1"/>
+  <text class="svg-t" x="714" y="303" text-anchor="middle">m′ = max(m, rowmax Sᵢⱼ),  α = e^(m − m′)</text>
+  <line class="svg-ar" x1="714" y1="314" x2="714" y2="322" marker-end="url(#ah)"/>
+
+  <rect class="svg-chip" x="546" y="328" width="336" height="50" rx="6" stroke-width="1.1"/>
+  <text class="svg-t" x="714" y="349" text-anchor="middle">l ← α·l + Σ e^(s − m′)</text>
+  <text class="svg-t" x="714" y="368" text-anchor="middle">a ← α·a + Σ e^(s − m′)·Vⱼ</text>
+
+  <path class="svg-ar-loop" d="M882,362 L908,362 L908,206 L886,206" marker-end="url(#ahl)"/>
+  <text class="svg-ts" x="920" y="284" text-anchor="middle" style="fill:var(--ok)" transform="rotate(90 920 284)">reuse scratch, next block</text>
+
+  <line class="svg-ar" x1="722" y1="410" x2="722" y2="424" marker-end="url(#ah)"/>
+  <rect class="svg-chip" x="546" y="430" width="352" height="38" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="722" y="454" text-anchor="middle">Oᵢ = a / l  — normalize once, at the very end</text>
+  <line class="svg-ar" x1="722" y1="468" x2="722" y2="482" marker-end="url(#ah)"/>
+
+  <rect class="svg-hbm" x="546" y="488" width="352" height="38" rx="7" stroke-width="1.2"/>
+  <text class="svg-t" x="722" y="512" text-anchor="middle">HBM: Oᵢ</text>
+
+  <text class="svg-ts" x="722" y="552" text-anchor="middle" style="fill:var(--ok)">full S and full P never exist in HBM at all</text>
+
+  <!-- legend -->
+  <rect x="24" y="584" width="14" height="12" rx="3" class="svg-hbm" stroke-width="1.1"/>
+  <text class="svg-ts" x="46" y="594">HBM / device memory</text>
+  <rect x="196" y="584" width="14" height="12" rx="3" class="svg-chip" stroke-width="1.1"/>
+  <text class="svg-ts" x="218" y="594">on-chip compute + scratch</text>
+  <rect x="396" y="584" width="14" height="12" rx="3" class="svg-bad" stroke-width="1.1"/>
+  <text class="svg-ts" x="418" y="594">large-matrix round trip we avoid</text>
+  <line x1="620" y1="590" x2="650" y2="590" class="svg-ar-loop"/>
+  <text class="svg-ts" x="658" y="594">tile loop</text>
+</svg>
+<figcaption>Normal attention vs FlashAttention: HBM traffic, on-chip compute, the round trip of the full S and P, and the K/V block update loop. A schematic — arrows show data dependencies, not byte counts or timings.</figcaption>
+</figure>
+
+<p>Reading top to bottom:</p>
+<ul>
+<li><strong>Left, normal attention</strong> is a representative unfused implementation; the red boxes and arrows highlight the full S and P being written to HBM and then read back.</li>
+<li><strong>Right, FlashAttention</strong> fixes one Q block and streams K/V in block by block. Inside the green frame, the current tile is computed, rescaled and accumulated; the dashed green arrow means "go do the next block".</li>
+<li><strong>Blue arrows</strong> are input and output traffic. They have not disappeared — this is not a picture of "FlashAttention never touches device memory".</li>
+<li><strong>On-chip compute</strong> means the compute units plus the registers, shared memory and other scratch right next to them — not a separate device.</li>
+</ul>
+<p class="small muted">The diagram uses the Q-block-outer, normalize-at-the-end forward organization used throughout this article, which is closer to FA2; it does not claim every version has the same loop order. Arrows are data dependencies — not byte counts, not timings, and not a claim that each is a single physical memory access. Training additionally saves a small per-row statistic for the backward pass, omitted here; see the <a href="#backward">appendix</a>.</p>
+
+<h3>6.2 Why can three accumulators change how execution works?</h3>
+<p>For one query, once a K/V block has been processed, the influence of its temporary scores and weights on the output has already been absorbed into <strong>m, l and a</strong>. When the next block arrives, only that accumulated state is needed — none of the past temporary scores or weights have to be kept.</p>
+<p>So we can:</p>
+<ol class="check">
+<li>Read in the current Q block and current K/V block, and compute the current score tile.</li>
+<li>Update the per-row max, and rescale the old accumulators if needed.</li>
+<li>Compute the scaled weights, immediately weight the current V, and update l and a.</li>
+<li>Reuse the scratch space for the next block; when all blocks are done, this Q block's output is ready.</li>
+</ol>
+<div class="callout key"><span class="label">The point</span><p><strong>We are not producing full S and P and then slicing them up — from the very start we only ever produce the tile we currently need.</strong></p></div>
+
+<h3>6.3 Why is this not just a space saving, but potentially faster?</h3>
+<p>HBM has large capacity; on-chip storage has small capacity but feeds the compute units at much higher bandwidth. A full S or P usually will not fit in the on-chip working set — a well-chosen tile will.</p>
+<p>FlashAttention fuses the operations belonging to one block of data, so a temporary result is consumed on-chip as soon as it is produced, cutting the movement of large intermediates across the memory hierarchy. That is the bridge between the mathematical "we never need to store the full P" and the hardware execution. <span class="ref"><a href="https://arxiv.org/pdf/2205.14135">FlashAttention §2–3</a>, <a href="https://tridao.me/publications/flash2/flash2.pdf">FlashAttention-2 §2–3</a></span></p>
+<p>It still has to process every query-key pair that should participate; the dominant cost of dense attention still grows quadratically with sequence length. Different Q blocks may also re-read the same K/V. So:</p>
+<blockquote><p><strong>Saving the intermediate matrices and moving less data does not mean every input is read exactly once, and it certainly does not mean attention became linear in cost.</strong></p></blockquote>
+<p class="small muted">No fixed speedup factor is claimed here. Real gains depend on shapes, precision, masking, hardware and implementation. For the full I/O budget see the <span class="pending" title="Advanced_Notes_CN.md, a companion document in the same repository">advanced notes</span>.</p>
+
+<h2 id="matrices"><span class="num">7</span>From hand arithmetic to real matrices: vectors, many queries, and Q blocks</h2>
+
+<h3>7.1 What if a value is not a single number?</h3>
+<p>Everything still holds. If A's value goes from 10 to <span class="math-inline" data-tex="[10,100]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>10</mn><mo separator="true">,</mo><mn>100</mn><mo stretchy="false">]</mo></math></span>, multiplying by the weight 0.5 gives <span class="math-inline" data-tex="[5,50]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>5</mn><mo separator="true">,</mo><mn>50</mn><mo stretchy="false">]</mo></math></span>. Each coordinate is multiplied by the same weight, and each is accumulated separately.</p>
+<p>A scalar still distributes over vector addition:</p>
+<div class="math-display" data-tex="c(\mathbf u+\mathbf v)=c\mathbf u+c\mathbf v."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>c</mi><mo stretchy="false">(</mo><mrow mathvariant="bold" class="mml-bold"><mi>u</mi></mrow><mo>+</mo><mrow mathvariant="bold" class="mml-bold"><mi>v</mi></mrow><mo stretchy="false">)</mo><mo>=</mo><mi>c</mi><mrow mathvariant="bold" class="mml-bold"><mi>u</mi></mrow><mo>+</mo><mi>c</mi><mrow mathvariant="bold" class="mml-bold"><mi>v</mi></mrow><mo separator="true">.</mo></math></div>
+<p>Extend the example's four values to</p>
+<div class="math-display" data-tex="[10,100],\ [20,200],\ [30,300],\ [40,400]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>10</mn><mo separator="true">,</mo><mn>100</mn><mo stretchy="false">]</mo><mo separator="true">,</mo><mspace width="0.25em"></mspace><mo stretchy="false">[</mo><mn>20</mn><mo separator="true">,</mo><mn>200</mn><mo stretchy="false">]</mo><mo separator="true">,</mo><mspace width="0.25em"></mspace><mo stretchy="false">[</mo><mn>30</mn><mo separator="true">,</mo><mn>300</mn><mo stretchy="false">]</mo><mo separator="true">,</mo><mspace width="0.25em"></mspace><mo stretchy="false">[</mo><mn>40</mn><mo separator="true">,</mo><mn>400</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<p>At the final "raw weights ÷ 4" scale:</p>
+<div class="math-display" data-tex="\mathbf a=[50,500],\qquad l=2,\qquad \mathbf o=\mathbf a/l=[25,250]."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow mathvariant="bold" class="mml-bold"><mi>a</mi></mrow><mo>=</mo><mo stretchy="false">[</mo><mn>50</mn><mo separator="true">,</mo><mn>500</mn><mo stretchy="false">]</mo><mo separator="true">,</mo><mspace width="2em"></mspace><mi>l</mi><mo>=</mo><mn>2</mn><mo separator="true">,</mo><mspace width="2em"></mspace><mrow mathvariant="bold" class="mml-bold"><mi>o</mi></mrow><mo>=</mo><mrow mathvariant="bold" class="mml-bold"><mi>a</mi></mrow><mo>/</mo><mi>l</mi><mo>=</mo><mo stretchy="false">[</mo><mn>25</mn><mo separator="true">,</mo><mn>250</mn><mo stretchy="false">]</mo><mo separator="true">.</mo></math></div>
+<div class="callout key"><span class="label">Shapes</span><p><strong>For one query, m and l are still one number each; a becomes a vector of the output dimension.</strong> Processing more keys never adds new coordinates to a — it only updates the accumulated values in the coordinates already there.</p></div>
+<p class="small muted">This is just the two-dimensional extension of the main scalar example; the <span class="pending" title="Advanced_Notes_CN.md, a companion document in the same repository">advanced notes</span> use a different pair of 2-D values with output <span class="math-inline" data-tex="[2,1.25]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>2</mn><mo separator="true">,</mo><mn>1.25</mn><mo stretchy="false">]</mo></math></span> — do not mix the two.</p>
+
+<h3>7.2 Multiple queries do not share one denominator</h3>
+<p>The same key generally scores differently against different queries. So <strong>each query has its own maximum, its own weight total, and its own output accumulator vector.</strong></p>
+<p>For query r:</p>
+<div class="math-display" data-tex="\begin{aligned}
+s_{rj}&amp;=\frac{q_r\cdot k_j}{\sqrt d},\\
+m_r&amp;=\max_j s_{rj},\\
+l_r&amp;=\sum_j e^{s_{rj}-m_r},\\
+\mathbf a_r&amp;=\sum_j e^{s_{rj}-m_r}\mathbf v_j.
+\end{aligned}"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mtable columnalign="right left" columnspacing="0" rowspacing="0.35em"><mtr><mtd><msub><mi>s</mi><mrow><mi>r</mi><mi>j</mi></mrow></msub></mtd><mtd><mo>=</mo><mfrac><mrow><msub><mi>q</mi><mrow><mi>r</mi></mrow></msub><mo>⋅</mo><msub><mi>k</mi><mrow><mi>j</mi></mrow></msub></mrow><mrow><msqrt><mi>d</mi></msqrt></mrow></mfrac><mo separator="true">,</mo></mtd></mtr><mtr><mtd><msub><mi>m</mi><mrow><mi>r</mi></mrow></msub></mtd><mtd><mo>=</mo><munder><mi mathvariant="normal" class="mml-fn">max</mi><mrow><mi>j</mi></mrow></munder><msub><mi>s</mi><mrow><mi>r</mi><mi>j</mi></mrow></msub><mo separator="true">,</mo></mtd></mtr><mtr><mtd><msub><mi>l</mi><mrow><mi>r</mi></mrow></msub></mtd><mtd><mo>=</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>r</mi><mi>j</mi></mrow></msub><mo>−</mo><msub><mi>m</mi><mrow><mi>r</mi></mrow></msub></mrow></msup><mo separator="true">,</mo></mtd></mtr><mtr><mtd><msub><mrow mathvariant="bold" class="mml-bold"><mi>a</mi></mrow><mrow><mi>r</mi></mrow></msub></mtd><mtd><mo>=</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>r</mi><mi>j</mi></mrow></msub><mo>−</mo><msub><mi>m</mi><mrow><mi>r</mi></mrow></msub></mrow></msup><msub><mrow mathvariant="bold" class="mml-bold"><mi>v</mi></mrow><mrow><mi>j</mi></mrow></msub><mo separator="true">.</mo></mtd></mtr></mtable></math></div>
+<p>Finally each gives <span class="math-inline" data-tex="\mathbf o_r=\mathbf a_r/l_r"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mrow mathvariant="bold" class="mml-bold"><mi>o</mi></mrow><mrow><mi>r</mi></mrow></msub><mo>=</mo><msub><mrow mathvariant="bold" class="mml-bold"><mi>a</mi></mrow><mrow><mi>r</mi></mrow></msub><mo>/</mo><msub><mi>l</mi><mrow><mi>r</mi></mrow></msub></math></span>. The division divides every output coordinate of a row by that row's own <span class="math-inline" data-tex="l_r"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>l</mi><mrow><mi>r</mi></mrow></msub></math></span> — it is not one shared denominator for the whole block.</p>
+
+<h3>7.3 A Q block just handles a group of queries at once</h3>
+<p>Let the query/key length be d and the value length <span class="math-inline" data-tex="d_v"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>d</mi><mrow><mi>v</mi></mrow></msub></math></span>; they need not be equal.</p>
+<div class="tw"><table>
+<thead><tr><th>Object</th><th>Full shape</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Q, K</td><td><span class="math-inline" data-tex="N\times d"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>N</mi><mo>×</mo><mi>d</mi></math></span></td><td>N query / key vectors</td></tr>
+<tr><td>V</td><td><span class="math-inline" data-tex="N\times d_v"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>N</mi><mo>×</mo><msub><mi>d</mi><mrow><mi>v</mi></mrow></msub></math></span></td><td>N value vectors</td></tr>
+<tr><td>S, P (logically)</td><td><span class="math-inline" data-tex="N\times N"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>N</mi><mo>×</mo><mi>N</mi></math></span></td><td>score and probability of every query against every key</td></tr>
+<tr><td>O</td><td><span class="math-inline" data-tex="N\times d_v"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>N</mi><mo>×</mo><msub><mi>d</mi><mrow><mi>v</mi></mrow></msub></math></span></td><td>output vector per query</td></tr>
+</tbody></table></div>
+<p>Handling <span class="math-inline" data-tex="B_r"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>B</mi><mrow><mi>r</mi></mrow></msub></math></span> queries and <span class="math-inline" data-tex="B_c"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>B</mi><mrow><mi>c</mi></mrow></msub></math></span> keys at a time makes the current score tile <span class="math-inline" data-tex="B_r\times B_c"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>B</mi><mrow><mi>r</mi></mrow></msub><mo>×</mo><msub><mi>B</mi><mrow><mi>c</mi></mrow></msub></math></span>.</p>
+<p>Which requires:</p>
+<ul>
+<li><span class="math-inline" data-tex="B_r"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>B</mi><mrow><mi>r</mi></mrow></msub></math></span> maxima m;</li>
+<li><span class="math-inline" data-tex="B_r"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>B</mi><mrow><mi>r</mi></mrow></msub></math></span> weight totals l;</li>
+<li>one <span class="math-inline" data-tex="B_r\times d_v"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>B</mi><mrow><mi>r</mi></mrow></msub><mo>×</mo><msub><mi>d</mi><mrow><mi>v</mi></mrow></msub></math></span> output accumulator block a.</li>
+</ul>
+<p>The <span class="math-inline" data-tex="Q_i"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>Q</mi><mrow><mi>i</mi></mrow></msub></math></span> in the diagram is the i-th Q block, not a single query. Batching queries together makes matrix multiplication and K/V reuse practical; <strong>the per-row normalization math is unchanged</strong>. The scratch space in the loop depends on the tile size and never has to hold the full <span class="math-inline" data-tex="N\times N"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>N</mi><mo>×</mo><mi>N</mi></math></span> matrix.</p>
+
+<h3>7.4 This is not "commutativity of matrix multiplication"</h3>
+<p>What we swapped earlier were scalar factors and summands. <strong>Matrix multiplication is not commutative in general.</strong> For example:</p>
+<div class="math-display" data-tex="A=\begin{bmatrix}1&amp;1\\0&amp;1\end{bmatrix},\qquad B=\begin{bmatrix}1&amp;0\\1&amp;1\end{bmatrix}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>A</mi><mo>=</mo><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>1</mn></mtd><mtd><mn>1</mn></mtd></mtr><mtr><mtd><mn>0</mn></mtd><mtd><mn>1</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mo separator="true">,</mo><mspace width="2em"></mspace><mi>B</mi><mo>=</mo><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>1</mn></mtd><mtd><mn>0</mn></mtd></mtr><mtr><mtd><mn>1</mn></mtd><mtd><mn>1</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mo separator="true">.</mo></math></div>
+<p>Then</p>
+<div class="math-display" data-tex="AB=\begin{bmatrix}2&amp;1\\1&amp;1\end{bmatrix},\qquad BA=\begin{bmatrix}1&amp;1\\1&amp;2\end{bmatrix}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>A</mi><mi>B</mi><mo>=</mo><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>2</mn></mtd><mtd><mn>1</mn></mtd></mtr><mtr><mtd><mn>1</mn></mtd><mtd><mn>1</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mo separator="true">,</mo><mspace width="2em"></mspace><mi>B</mi><mi>A</mi><mo>=</mo><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>1</mn></mtd><mtd><mn>1</mn></mtd></mtr><mtr><mtd><mn>1</mn></mtd><mtd><mn>2</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mo separator="true">.</mo></math></div>
+<p>The top-left entry alone already differs: for AB it is <span class="math-inline" data-tex="1\times1+1\times1=2"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>×</mo><mn>1</mn><mo>+</mo><mn>1</mn><mo>×</mo><mn>1</mn><mo>=</mo><mn>2</mn></math></span>, for BA it is <span class="math-inline" data-tex="1\times1+0\times0=1"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>×</mo><mn>1</mn><mo>+</mo><mn>0</mn><mo>×</mo><mn>0</mn><mo>=</mo><mn>1</mn></math></span>.</p>
+<p>Matrix multiplication is associative when the dimensions line up, <span class="math-inline" data-tex="(AB)C=A(BC)"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">(</mo><mi>A</mi><mi>B</mi><mo stretchy="false">)</mo><mi>C</mi><mo>=</mo><mi>A</mi><mo stretchy="false">(</mo><mi>B</mi><mi>C</mi><mo stretchy="false">)</mo></math></span>, and it distributes — but that does not let us reach across the non-linear softmax in the middle and turn attention into <span class="math-inline" data-tex="Q(K^\top V)"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>Q</mi><mo stretchy="false">(</mo><msup><mi>K</mi><mrow><mo>⊤</mo></mrow></msup><mi>V</mi><mo stretchy="false">)</mo></math></span>.</p>
+<div class="callout warn"><span class="label">Don't misread it</span><p>What FlashAttention changes is <strong>how the computation is grouped, what state is accumulated, and what gets stored</strong> — not the roles of Q, K and V.</p></div>
+
+<h2 id="cpu"><span class="num">8</span>A CPU comparison: matmul tiling vs. fusing the whole attention</h2>
+
+<h3>8.1 Does the CPU also hit "compute waiting on data"?</h3>
+<p>Yes. The CPU also has a hierarchy of storage with different capacities and access costs: registers, the cache levels, main memory.</p>
+<p>Suppose we compute</p>
+<div class="math-display" data-tex="\begin{bmatrix}1&amp;2\\3&amp;4\end{bmatrix}\begin{bmatrix}5&amp;6\\7&amp;8\end{bmatrix}=\begin{bmatrix}19&amp;22\\43&amp;50\end{bmatrix}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>1</mn></mtd><mtd><mn>2</mn></mtd></mtr><mtr><mtd><mn>3</mn></mtd><mtd><mn>4</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>5</mn></mtd><mtd><mn>6</mn></mtd></mtr><mtr><mtd><mn>7</mn></mtd><mtd><mn>8</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mo>=</mo><mrow><mo stretchy="true">[</mo><mtable columnalign="center center" columnspacing="0.6em" rowspacing="0.35em"><mtr><mtd><mn>19</mn></mtd><mtd><mn>22</mn></mtd></mtr><mtr><mtd><mn>43</mn></mtd><mtd><mn>50</mn></mtd></mtr></mtable><mo stretchy="true">]</mo></mrow><mo separator="true">.</mo></math></div>
+<p>The top-left entry is <span class="math-inline" data-tex="1\times5+2\times7"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>×</mo><mn>5</mn><mo>+</mo><mn>2</mn><mo>×</mo><mn>7</mn></math></span> and the top-right is <span class="math-inline" data-tex="1\times6+2\times8"><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn><mo>×</mo><mn>6</mn><mo>+</mo><mn>2</mn><mo>×</mo><mn>8</mn></math></span>. Both outputs need the left matrix's first row <span class="math-inline" data-tex="[1,2]"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo stretchy="false">[</mo><mn>1</mn><mo separator="true">,</mo><mn>2</mn><mo stretchy="false">]</mo></math></span>.</p>
+<p>Once a piece of data has made it into a register or cache, we want to finish as many computations that depend on it as we can while it is still there — for instance updating a small block of outputs at once, rather than coming back much later for another related output.</p>
+<p>That is the starting point for CPU tiling. <strong>It does not reduce the number of multiplications; it reorders the computation to shorten the gap between reuses of the same data.</strong> <span class="ref"><a href="https://github.com/flame/how-to-optimize-gemm/wiki">FLAME GEMM optimization tutorial</a></span></p>
+
+<h3>8.2 What do blocking, packing and fusion each solve?</h3>
+<div class="tw"><table>
+<thead><tr><th>Technique</th><th>Problem it faces</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td>Cache blocking</td><td>a large working set will not stay resident in the nearer caches</td><td>arrange access and computation block by block, reusing the current data as much as possible</td></tr>
+<tr><td>Register blocking</td><td>repeatedly loading and storing the same input or partial sum costs something</td><td>update a small output block at a time so partial sums can stay in registers</td></tr>
+<tr><td>Packing</td><td>the original layout can make micro-kernel access non-contiguous and awkward</td><td>rearrange the needed block into a layout better suited to the accesses that follow</td></tr>
+<tr><td>Operator fusion</td><td>one step's temporary output has to be handed to the next step</td><td>organize supported operations together to shorten the lifetime of the temporary</td></tr>
+</tbody></table></div>
+<p class="small muted">Packing itself costs data movement — it trades one reorganization for easier access afterwards, and is not unconditionally faster. These matmul optimizations can be worked through step by step in the <a href="https://github.com/flame/how-to-optimize-gemm/wiki">FLAME blocking / packing tutorial</a>.</p>
+
+<h3>8.3 Matmul is already tiled — so why do we still need an attention-level solution?</h3>
+<p>Because these are two different scopes:</p>
+<ul>
+<li><strong>Inside a single matmul</strong>: how do we compute <span class="math-inline" data-tex="QK^\top"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>Q</mi><msup><mi>K</mi><mrow><mo>⊤</mo></mrow></msup></math></span> efficiently?</li>
+<li><strong>Between the stages of attention</strong>: once the scores exist, must the full S and P still be stored before the next step can run?</li>
+</ul>
+<p>Even if both <span class="math-inline" data-tex="QK^\top"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>Q</mi><msup><mi>K</mi><mrow><mo>⊤</mo></mrow></msup></math></span> and PV use excellent tiled matmuls, as long as a complete S and P must be handed between them, the intermediate matrices are still there.</p>
+<p>And the original softmax obstacle does not disappear just because the matmul got faster: the current block still does not know the whole-row normalization.</p>
+<p>Online softmax plus rescaling supply the mathematical conditions for stepping over that obstacle, letting a score tile feed the final output accumulation directly. <strong>This set of recurrences is not GPU-specific; a CPU can use it too.</strong> Different hardware just needs different tiling, layout, vectorization and threading.</p>
+
+<h3>8.4 CPU cache and GPU shared memory are not the same thing</h3>
+<div class="tw"><table>
+<thead><tr><th>Concern</th><th>Typical CPU approach</th><th>GPU FlashAttention as described here</th></tr></thead>
+<tbody>
+<tr><td>Input reuse</td><td>arrange blocks and loops around cache and registers</td><td>arrange Q/K/V tiles around on-chip resources</td></tr>
+<tr><td>Intermediates</td><td>local accumulation plus fusion of supported operations</td><td>scores and scaled weights go straight into updating m, l, a</td></tr>
+<tr><td>Storage management</td><td>ordinary cache fill and eviction is mostly hardware-managed</td><td>shared memory is an on-chip working area the kernel organizes explicitly</td></tr>
+<tr><td>Actual speed</td><td>depends on cache hits, SIMD, threading, …</td><td>depends on memory access, matrix units, parallel scheduling, …</td></tr>
+</tbody></table></div>
+<p>What is being compared here is roles and ideas, not a one-to-one hardware mapping. GPUs also have hardware-managed caches; and a CPU writing a temporary array does not mean every write immediately reaches DRAM, since later reads may hit in cache. So the logical arrows in the diagram must not be read as actual CPU main-memory traffic.</p>
+<p>Attention-level optimized implementations do exist on CPU. The oneDNN documentation lists an optimized CPU SDPA inference path along with its shape, runtime and parallelism conditions; that does not mean any CPU, framework call or training path automatically uses the same implementation. <span class="ref"><a href="https://uxlfoundation.github.io/oneDNN/dev_guide_graph_sdpa.html">oneDNN SDPA: implementation limitations</a></span></p>
+
+<h3>8.5 What is this comparison supposed to establish?</h3>
+<p>Not "CPU versus GPU, and by how much", and not "hand-written tiling beats optimized libraries". What we are comparing is:</p>
+<blockquote><p><strong>CPU matmul tiling already embodies "bring it close, then use it several times"; FlashAttention additionally has to resolve softmax's whole-row dependency before that kind of reuse can be extended across the entire attention computation.</strong></p></blockquote>
+<p class="small muted">For a more detailed CPU working-set budget, cache caveats and experimental boundaries, see the <span class="pending" title="Advanced_Notes_CN.md, a companion document in the same repository">advanced CPU notes</span>. This article performs no CPU/GPU performance measurement and claims no speedup factor on that basis.</p>
+
+<h2 id="practice"><span class="num">9</span>Putting the problems and the solutions side by side</h2>
+<div class="tw"><table>
+<thead><tr><th>Problem encountered</th><th>Why the direct approach stalls</th><th>The corresponding solution</th></tr></thead>
+<tbody>
+<tr><td>Full S and P are large, and must be passed between operators</td><td>all intermediates are produced first, then consumed by the next step</td><td>try to work on only the current tile</td></tr>
+<tr><td>The current block cannot determine the final probabilities</td><td>softmax depends on the whole row's denominator</td><td>accumulate numerator and denominator, divide at the end</td></tr>
+<tr><td>The exponentials may overflow</td><td>raw <span class="math-inline" data-tex="e^s"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>s</mi></mrow></msup></math></span> can exceed the numeric range</td><td>subtract a common max before exponentiating</td></tr>
+<tr><td>A later block raises the max</td><td>old and new contributions sit on different scaling references</td><td>rescale the old l and a together with <span class="math-inline" data-tex="e^{m-m&#x27;}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi>m</mi><mo>−</mo><mi>m</mi><mo class="mml-prime">′</mo></mrow></msup></math></span></td></tr>
+<tr><td>Mathematical equivalence is not automatic hardware speedup</td><td>a poor execution schedule still moves a lot of data</td><td>use tiling and fusion so temporaries are consumed on-chip</td></tr>
+</tbody></table></div>
+<p>In one sentence:</p>
+<blockquote><p><strong>FlashAttention replaces the full intermediate matrices with statistics that can be updated block by block, then maps that way of computing onto the GPU's memory hierarchy to reduce data movement.</strong></p></blockquote>
+<p class="small muted">"Mathematically equivalent" here means it yields the same attention under real arithmetic. Floating-point rounds, and changing summation order does not guarantee bit-for-bit identical results. For instance in float64, adding <span class="math-inline" data-tex="10^{16}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mn>10</mn><mrow><mn>16</mn></mrow></msup></math></span> and <span class="math-inline" data-tex="-10^{16}"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo>−</mo><msup><mn>10</mn><mrow><mn>16</mn></mrow></msup></math></span> first and then adding 1 can give 1; computing <span class="math-inline" data-tex="-10^{16}+1"><math xmlns="http://www.w3.org/1998/Math/MathML"><mo>−</mo><msup><mn>10</mn><mrow><mn>16</mn></mrow></msup><mo>+</mo><mn>1</mn></math></span> first, rounding, and then adding <span class="math-inline" data-tex="10^{16}"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mn>10</mn><mrow><mn>16</mn></mrow></msup></math></span> can give 0. That is finite precision at work, not a failure of associativity over the reals.</p>
+<div class="callout key"><span class="label">Self-check</span>
+<p>Once you have read this, see whether you can answer:</p>
+<ol style="margin-bottom:0">
+<li>Why does Z equal 8? And why does the scaled l then equal 2?</li>
+<li>Why is keeping only each block's own average not enough?</li>
+<li>Why must the rescale be applied to l and a at the same time?</li>
+<li>In the diagram, which movements were avoided, and which still remain?</li>
+<li>CPU matmul already does blocking — why does that not mean the whole attention is already fused?</li>
+</ol>
+</div>
+
+<h2 id="backward">Appendix: without storing the probability matrix, how does backpropagation work?</h2>
+<p>Earlier we said a tile can be released once it has been used — meaning it does not need to be kept around for the sake of later blocks. But training needs the probabilities to compute gradients. So what happens?</p>
+<div class="callout a"><span class="label">Solution</span><p><strong>Keep enough information to reconstruct them, and recompute block by block when needed.</strong> FA2, for example, keeps Q, K, V and O, plus a log-sum-exp statistic L for each query row; the backward pass also receives the output gradient from the following layer. L is a per-row statistic, not a probability matrix. <span class="ref"><a href="https://tridao.me/publications/flash2/flash2.pdf">FlashAttention-2 §3.1.2</a></span></p></div>
+<p>Reusing the notation above, the per-row statistic can be written</p>
+<div class="math-display" data-tex="L=m+\ln l=\ln\left(\sum_j e^{s_j}\right)."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mi>L</mi><mo>=</mo><mi>m</mi><mo>+</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mi>l</mi><mo>=</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mrow><mo stretchy="true">(</mo><munder><mo class="mml-op" movablelimits="false">∑</mo><mrow><mi>j</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub></mrow></msup><mo stretchy="true">)</mo></mrow><mo separator="true">.</mo></math></div>
+<p>That identity comes from <span class="math-inline" data-tex="Z=e^m l"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>Z</mi><mo>=</mo><msup><mi>e</mi><mrow><mi>m</mi></mrow></msup><mi>l</mi></math></span>. In practice L is obtained from the stably-computed m and l, without ever forming the possibly-overflowing Z.</p>
+<p>So when the backward pass recomputes some score, its probability is simply</p>
+<div class="math-display" data-tex="p_j=e^{s_j-L}."><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>p</mi><mrow><mi>j</mi></mrow></msub><mo>=</mo><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mi>j</mi></mrow></msub><mo>−</mo><mi>L</mi></mrow></msup><mo separator="true">.</mo></math></div>
+<p>In our example <span class="math-inline" data-tex="L=\ln4+\ln2=\ln8"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>L</mi><mo>=</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>4</mn><mo>+</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn><mo>=</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>8</mn></math></span>, and A's probability is recovered as <span class="math-inline" data-tex="e^{\ln2-\ln8}=2/8"><math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>e</mi><mrow><mi mathvariant="normal" class="mml-fn">ln</mi><mn>2</mn><mo>−</mo><mi mathvariant="normal" class="mml-fn">ln</mi><mn>8</mn></mrow></msup><mo>=</mo><mn>2</mn><mo>/</mo><mn>8</mn></math></span>.</p>
+<p>The backward pass recomputes scores block by block, recovers the probabilities, and uses them immediately for gradient accumulation — rather than rebuilding a whole P and storing it permanently. The cost is extra arithmetic; the benefit is not storing and re-reading an enormous intermediate matrix. <span class="muted">On suitable hardware and at suitable problem sizes that trade is worth it, but it does not license the claim that recomputation is always faster.</span></p>
+<p class="small muted">This only explains why training is still possible; it does not work through the full gradient derivation. See the <span class="pending" title="Advanced_Notes_CN.md, a companion document in the same repository">advanced backward-pass notes</span>.</p>
+
+<h2 id="references">Scope and references</h2>
+<ul>
+<li>The main text discusses dense attention with a single sample, a single head, no mask or dropout, and finite scores. Multi-head and batching can be understood as many such computations; scheduling is not discussed here.</li>
+<li>A causal mask changes which query-key pairs may participate; it cannot change the correspondence between a key and its value. Fully-masked rows, dropout and similar cases need extra handling.</li>
+<li><span class="math-inline" data-tex="N\times N"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>N</mi><mo>×</mo><mi>N</mi></math></span> is this article's full-sequence shape assumption; single-token decode generally has a different shape, so this memory budget does not carry over directly.</li>
+<li>The text uses a fixed-Q-block, normalize-at-the-end teaching organization. The concrete execution differences between FA1, FA2 and FA3 are covered in the companion advanced notes.</li>
+<li>All decimal and matrix examples are constructed for teaching, and the comparison diagram is an original schematic, not a performance measurement.</li>
+</ul>
+<p><strong>Primary sources:</strong></p>
+<ol>
+<li><a href="https://arxiv.org/pdf/2205.14135">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a> — problem background, HBM vs on-chip storage, tiling and recomputation.</li>
+<li><a href="https://arxiv.org/pdf/1805.02867">Online normalizer calculation for softmax</a> — stable softmax and the online update.</li>
+<li><a href="https://tridao.me/publications/flash2/flash2.pdf">FlashAttention-2</a> — the normalize-at-the-end forward organization, log-sum-exp, and the backward pass.</li>
+<li><a href="https://github.com/flame/how-to-optimize-gemm/wiki">FLAME: How to Optimize GEMM</a> — register blocking, cache blocking, packing.</li>
+<li><a href="https://uxlfoundation.github.io/oneDNN/dev_guide_graph_sdpa.html">oneDNN SDPA</a> — attention graph optimization and platform support conditions. Platform capability depends on the version you use.</li>
+</ol>
+
+</main>
+</div>
+
+<footer>
+  Math rendered as native MathML — no external assets, works fully offline
+</footer>
+
+<script>
+// ---- theme ----
+(function(){
+  var saved = localStorage.getItem('fa-theme');
+  var t = saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-theme', t);
+  document.addEventListener('DOMContentLoaded', function(){
+    var b = document.getElementById('themeBtn');
+    if (!b) return;
+    b.addEventListener('click', function(){
+      var cur = document.documentElement.getAttribute('data-theme');
+      var nxt = cur === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', nxt);
+      localStorage.setItem('fa-theme', nxt);
+    });
+  });
+})();
+
+// ---- MathML support check: fall back to readable TeX if the browser lacks it ----
+(function(){
+  var ok = (typeof MathMLElement === 'function') ||
+           (document.createElement('math') instanceof HTMLUnknownElement === false &&
+            'MathMLElement' in window);
+  if (ok) return;
+  document.documentElement.classList.add('no-mathml');
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('[data-tex]').forEach(function(el){
+      el.textContent = el.getAttribute('data-tex');
+    });
+  });
+})();
+
+// ---- scrollspy + progress ----
+(function(){
+  function init(){
+    var links = [].slice.call(document.querySelectorAll('#toc a'));
+    var secs  = links.map(function(a){ return document.getElementById(a.getAttribute('href').slice(1)); });
+    var bar   = document.getElementById('progress');
+    function onScroll(){
+      var y = window.scrollY + 90, idx = 0;
+      for (var i=0;i<secs.length;i++){ if (secs[i] && secs[i].offsetTop <= y) idx = i; }
+      links.forEach(function(a,i){ a.classList.toggle('active', i===idx); });
+      var h = document.documentElement.scrollHeight - window.innerHeight;
+      if (bar) bar.style.width = (h > 0 ? (window.scrollY / h * 100) : 0) + '%';
+    }
+    window.addEventListener('scroll', onScroll, {passive:true});
+    window.addEventListener('resize', onScroll);
+    onScroll();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
+</script>
+</body>
+</html>
