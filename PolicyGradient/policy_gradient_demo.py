@@ -118,38 +118,73 @@ def mse(prediction, target):
 
 
 def method_1(b, value, qnet, gamma):
-    weights = b.returns[0].expand_as(b.returns)  # No extra gamma**t.
-    return weights, None
+    # Actor：整条轨迹共用 G_0，不再乘 gamma**t。
+    weights = b.returns[0].expand_as(b.returns)
+    critic_loss = None  # 无 Critic 网络，也没有 Critic 更新。
+    return weights, critic_loss
 
 
 def method_2(b, value, qnet, gamma):
+    # Actor：每一步只看从该步开始的回报。
     weights = b.discounts * b.returns
-    return weights, None
+    critic_loss = None  # 无 Critic 网络，也没有 Critic 更新。
+    return weights, critic_loss
 
 
 def method_3(b, value, qnet, gamma):
-    v = value(b.states)  # Pre-update, action-independent baseline.
-    weights = b.discounts * (b.returns - v)
-    return weights, mse(v, b.returns)  # MC V target.
+    # 1. Critic 预测：V 网络估计当前策略的平均回报。
+    v = value(b.states)
+    # 2. Critic target：完整轨迹的 MC 回报，不是网络预测。
+    critic_target = b.returns.detach()
+    # 3. Actor 权重：实际回报减去更新前的 V；停止整个权重的梯度。
+    weights = (b.discounts * (b.returns - v)).detach()
+    # 4. Critic Loss：只对预测 v 反传，让 v 接近 MC 回报。
+    critic_loss = 0.5 * (v - critic_target).square().mean()
+    return weights, critic_loss
 
 
 def method_4(b, value, qnet, gamma):
+    # 1. Critic 预测：Q 网络取出实际采样动作的 Q 值。
     q = qnet(b.states, b.actions)
-    weights = b.discounts * q
-    return weights, mse(q, b.returns)  # MC Q^pi target, no max/DQN.
+    # 2. Critic target：MC 回报 G_t；不是 DQN 的 max target。
+    critic_target = b.returns.detach()
+    # 3. Actor 权重：使用更新前的 Q，停止 Q 支路梯度。
+    weights = (b.discounts * q).detach()
+    # 4. Critic Loss：只对预测 q 反传。
+    critic_loss = 0.5 * (q - critic_target).square().mean()
+    return weights, critic_loss
 
 
 def method_5(b, value, qnet, gamma):
-    q, v = qnet(b.states, b.actions), value(b.states)
-    weights = b.discounts * (q - v)
-    return weights, mse(q, b.returns) + mse(v, b.returns)
+    # 1. 两个独立 Critic：Q 预测该动作回报；V 预测平均回报。
+    q = qnet(b.states, b.actions)
+    v = value(b.states)
+    # 2. 两个 Critic 都用完整 MC 回报作 target。
+    critic_target = b.returns.detach()
+    # 3. Actor 权重：Q - V 是优势估计；两条 Critic 支路都停止梯度。
+    weights = (b.discounts * (q - v)).detach()
+    # 4. 分别计算两个 Critic Loss，再相加。
+    q_loss = 0.5 * (q - critic_target).square().mean()
+    v_loss = 0.5 * (v - critic_target).square().mean()
+    critic_loss = q_loss + v_loss
+    return weights, critic_loss
 
 
 def method_6(b, value, qnet, gamma):
+    # 1. Critic 当前预测：需要梯度，用于训练 V 网络。
     v = value(b.states)
-    y = td_target(b, value, gamma)  # no_grad: entire TD target is constant.
-    weights = b.discounts * (y - v)
-    return weights, mse(v, y)  # One-step TD semi-gradient.
+    # 2. Critic target：真实 reward + 下一状态预测；整个目标停止梯度。
+    with torch.no_grad():
+        next_v = torch.zeros_like(b.rewards)
+        live = ~b.terminated  # 真正终止时 next_v = 0；不计算终止状态的 V。
+        next_v[live] = value(b.next_states[live])
+        critic_target = b.rewards + gamma * next_v
+    # 3. Actor 权重：TD error 作为优势估计，整个权重停止梯度。
+    advantage = critic_target - v
+    weights = (b.discounts * advantage).detach()
+    # 4. Critic Loss：只对当前预测 v 反传，不对下一状态 V 反传。
+    critic_loss = 0.5 * (v - critic_target).square().mean()
+    return weights, critic_loss
 
 
 METHODS = [method_1, method_2, method_3, method_4, method_5, method_6]
@@ -159,6 +194,24 @@ def actor_loss(actor, batch, weights):
     # Sum within an episode. For B episodes: sum their losses / B.
     # Do not backpropagate into Q, V, targets, sampling, or the environment.
     return -(weights.detach() * actor(batch.states).log_prob(batch.actions)).sum()
+
+
+def update_networks(actor, b, weights, critic_loss, actor_opt, critic_opt):
+    # Actor Loss：权重作常数，只对 Actor 的 log probability 反传。
+    log_prob = actor(b.states).log_prob(b.actions)
+    actor_loss = -(weights.detach() * log_prob).sum()
+    if not torch.isfinite(actor_loss) or (critic_loss is not None and
+                                         not torch.isfinite(critic_loss)):
+        raise FloatingPointError('Non-finite loss')
+    # 更新 Actor。
+    actor_opt.zero_grad(set_to_none=True)
+    actor_loss.backward()
+    actor_opt.step()
+    # 更新 Critic（方法 1、2 跳过；方法 5 的优化器包含 Q 和 V 参数）。
+    if critic_loss is not None:
+        critic_opt.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        critic_opt.step()
 
 
 def train(method=6, episodes=300, gamma=0.9, seed=7, verbose=True):
@@ -177,17 +230,7 @@ def train(method=6, episodes=300, gamma=0.9, seed=7, verbose=True):
         b = rollout(actor, env, gamma)
         # Both losses use pre-update predictions. No fitting before weighting.
         weights, critic_loss = METHODS[method - 1](b, value, qnet, gamma)
-        loss = actor_loss(actor, b, weights)
-        if not torch.isfinite(loss) or (critic_loss is not None and
-                                       not torch.isfinite(critic_loss)):
-            raise FloatingPointError('Non-finite loss')
-        actor_opt.zero_grad(set_to_none=True)
-        loss.backward()
-        actor_opt.step()
-        if critic_opt is not None:
-            critic_opt.zero_grad(set_to_none=True)
-            critic_loss.backward()
-            critic_opt.step()
+        update_networks(actor, b, weights, critic_loss, actor_opt, critic_opt)
         # Discard b, collect again with the updated policy.
         if verbose and (episode % 50 == 0 or episode == episodes - 1):
             with torch.no_grad():
