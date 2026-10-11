@@ -1,4 +1,5 @@
 import itertools
+from argparse import Namespace
 import unittest
 import torch
 import policy_gradient_demo as pg
@@ -15,7 +16,7 @@ class Tests(unittest.TestCase):
         for method in range(1, 7):
             actor, v, q = pg.Actor(), pg.ValueCritic(), pg.QCritic()
             b = pg.rollout(actor, pg.ToyEnv(), .9)
-            weights, critic_loss = pg.METHODS[method-1](b, v, q, .9)
+            weights, critic_loss = pg.compute_losses(Namespace(method=method), b, v, q, .9)
             pg.actor_loss(actor, b, weights).backward()
             self.assertTrue(any(p.grad is not None for p in actor.parameters()))
             self.assertTrue(all(p.grad is None for n in (v, q) for p in n.parameters()))
@@ -32,8 +33,8 @@ class Tests(unittest.TestCase):
         q = lambda states, actions: states @ torch.tensor([10., 7., 9.])
         expected = [[10.9,10.9,10.9], [10.9,9.9,8.1], [2.9,4.5,4.86],
                     [10.,6.3,7.29], [2.,.9,4.05], [-1.6,-.36,4.86]]
-        for i, method in enumerate(pg.METHODS):
-            weights, loss = method(b,v,q,.9)
+        for i in range(6):
+            weights, loss = pg.compute_losses(Namespace(method=i+1),b,v,q,.9)
             torch.testing.assert_close(weights,torch.tensor(expected[i]))
             target = pg.td_target(b,v,.9) if i == 5 else b.returns
             terms = []

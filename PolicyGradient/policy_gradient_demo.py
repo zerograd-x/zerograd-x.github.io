@@ -117,77 +117,43 @@ def mse(prediction, target):
     return 0.5 * (prediction - target.detach()).square().mean()
 
 
-def method_1(b, value, qnet, gamma):
-    # Actor：整条轨迹共用 G_0，不再乘 gamma**t。
-    weights = b.returns[0].expand_as(b.returns)
-    critic_loss = None  # 无 Critic 网络，也没有 Critic 更新。
+def compute_losses(args, b, value, qnet, gamma):
+    # 公用输入：完整、连续的一条轨迹；最后一步真正终止。
+    if not b.terminated[-1] or b.terminated[:-1].any():
+        raise ValueError('Expected one complete episode ending in true termination')
+    rewards = b.rewards
+    returns = b.returns.detach()  # MC 采样回报，不带梯度。
+    discounts = b.discounts
+    horizon = len(rewards)
+    v = value(b.states) if args.method in (3, 5, 6) else None
+    q = qnet(b.states, b.actions) if args.method in (4, 5) else None
+
+    # Actor：六种方法只改变 weights。
+    if args.method == 1:
+        weights = returns[0].expand(horizon)  # NO extra gamma**t
+    elif args.method == 2:
+        weights = discounts * returns
+    elif args.method == 3:
+        weights = discounts * (returns - v)
+    elif args.method == 4:
+        weights = discounts * q
+    elif args.method == 5:
+        weights = discounts * (q - v)
+    else:
+        # 完整轨迹中 v[1:] 就是下一状态预测；最后真正终止，尾值为 0。
+        target = rewards + gamma * torch.cat([v.detach()[1:], v.new_zeros(1)])
+        weights = discounts * (target - v)  # TD error 作为优势估计。
+
+    # Critic：1、2 无 Critic；3、5 训练 V；4、5 训练 Q；6 用 TD 训练 V。
+    critic_loss = None
+    if args.method in (3, 5):
+        critic_loss = 0.5 * (v - returns).square().mean()
+    if args.method in (4, 5):
+        q_loss = 0.5 * (q - returns).square().mean()
+        critic_loss = q_loss if critic_loss is None else critic_loss + q_loss
+    if args.method == 6:
+        critic_loss = 0.5 * (v - target.detach()).square().mean()
     return weights, critic_loss
-
-
-def method_2(b, value, qnet, gamma):
-    # Actor：每一步只看从该步开始的回报。
-    weights = b.discounts * b.returns
-    critic_loss = None  # 无 Critic 网络，也没有 Critic 更新。
-    return weights, critic_loss
-
-
-def method_3(b, value, qnet, gamma):
-    # 1. Critic 预测：V 网络估计当前策略的平均回报。
-    v = value(b.states)
-    # 2. Critic target：完整轨迹的 MC 回报，不是网络预测。
-    critic_target = b.returns.detach()
-    # 3. Actor 权重：实际回报减去更新前的 V；停止整个权重的梯度。
-    weights = (b.discounts * (b.returns - v)).detach()
-    # 4. Critic Loss：只对预测 v 反传，让 v 接近 MC 回报。
-    critic_loss = 0.5 * (v - critic_target).square().mean()
-    return weights, critic_loss
-
-
-def method_4(b, value, qnet, gamma):
-    # 1. Critic 预测：Q 网络取出实际采样动作的 Q 值。
-    q = qnet(b.states, b.actions)
-    # 2. Critic target：MC 回报 G_t；不是 DQN 的 max target。
-    critic_target = b.returns.detach()
-    # 3. Actor 权重：使用更新前的 Q，停止 Q 支路梯度。
-    weights = (b.discounts * q).detach()
-    # 4. Critic Loss：只对预测 q 反传。
-    critic_loss = 0.5 * (q - critic_target).square().mean()
-    return weights, critic_loss
-
-
-def method_5(b, value, qnet, gamma):
-    # 1. 两个独立 Critic：Q 预测该动作回报；V 预测平均回报。
-    q = qnet(b.states, b.actions)
-    v = value(b.states)
-    # 2. 两个 Critic 都用完整 MC 回报作 target。
-    critic_target = b.returns.detach()
-    # 3. Actor 权重：Q - V 是优势估计；两条 Critic 支路都停止梯度。
-    weights = (b.discounts * (q - v)).detach()
-    # 4. 分别计算两个 Critic Loss，再相加。
-    q_loss = 0.5 * (q - critic_target).square().mean()
-    v_loss = 0.5 * (v - critic_target).square().mean()
-    critic_loss = q_loss + v_loss
-    return weights, critic_loss
-
-
-def method_6(b, value, qnet, gamma):
-    # 1. Critic 当前预测：需要梯度，用于训练 V 网络。
-    v = value(b.states)
-    # 2. Critic target：真实 reward + 下一状态预测；整个目标停止梯度。
-    with torch.no_grad():
-        next_v = torch.zeros_like(b.rewards)
-        live = ~b.terminated  # 真正终止时 next_v = 0；不计算终止状态的 V。
-        next_v[live] = value(b.next_states[live])
-        critic_target = b.rewards + gamma * next_v
-    # 3. Actor 权重：TD error 作为优势估计，整个权重停止梯度。
-    advantage = critic_target - v
-    weights = (b.discounts * advantage).detach()
-    # 4. Critic Loss：只对当前预测 v 反传，不对下一状态 V 反传。
-    critic_loss = 0.5 * (v - critic_target).square().mean()
-    return weights, critic_loss
-
-
-METHODS = [method_1, method_2, method_3, method_4, method_5, method_6]
 
 
 def actor_loss(actor, batch, weights):
@@ -225,11 +191,12 @@ def train(method=6, episodes=300, gamma=0.9, seed=7, verbose=True):
     critic_params = [p for net in (value, qnet) if net is not None
                      for p in net.parameters()]
     critic_opt = torch.optim.Adam(critic_params, lr=0.01) if critic_params else None
+    args = argparse.Namespace(method=method)
     env = ToyEnv()
     for episode in range(episodes):
         b = rollout(actor, env, gamma)
         # Both losses use pre-update predictions. No fitting before weighting.
-        weights, critic_loss = METHODS[method - 1](b, value, qnet, gamma)
+        weights, critic_loss = compute_losses(args, b, value, qnet, gamma)
         update_networks(actor, b, weights, critic_loss, actor_opt, critic_opt)
         # Discard b, collect again with the updated policy.
         if verbose and (episode % 50 == 0 or episode == episodes - 1):

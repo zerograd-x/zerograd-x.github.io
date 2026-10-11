@@ -1,11 +1,11 @@
 # Policy Gradient · 六种权重，一条主线
 
-保留原网页的米白／深绿色配色、方法切换与轨迹实验。六种方法共用一个 PyTorch 训练框架，每个方法面板仅展示自己的差异函数，并列出网络、两个 Loss、stopgrad 与流程图。
+保留原网页的米白／深绿色配色、方法切换与轨迹实验。六种方法共用一个 PyTorch 训练框架，每个方法面板仅展示Actor 权重与 Critic Loss 的条件分支，并列出网络、两个 Loss、stopgrad 与流程图。
 
 ## 文件
 
 - `index.html`：可离线打开，内嵌完整代码，下载按钮无需联网。
-- `policy_gradient_demo.py`：共享 Actor / ValueCritic / QCritic、环境、rollout、returns、训练框架与六个差异函数。
+- `policy_gradient_demo.py`：共享 Actor / ValueCritic / QCritic、环境、rollout、returns、训练框架与compute_losses 中的六种条件分支。
 - `test_policy_gradient.py`：梯度、终止、回报、训练测试。
 - `build_page.py` + `template.html`：从同一份 Python 源码生成页面展示和下载内容，避免复制后不一致。
 
@@ -59,4 +59,4 @@ git commit -m "Clarify six policy gradient methods with shared runnable code"
 git push origin main
 ```
 
-等待 GitHub Pages 部署成功后访问 `https://zerograd-x.github.io/PolicyGradient/`，确认方法 6 中出现“差异代码 · method_6”。如果使用 Actions 自定义发布，沿用原工作流并确保其包含 `PolicyGradient/index.html`。
+等待 GitHub Pages 部署成功后访问 `https://zerograd-x.github.io/PolicyGradient/`，确认方法 6 中出现“差异代码 · 当前 args.method = 6”。如果使用 Actions 自定义发布，沿用原工作流并确保其包含 `PolicyGradient/index.html`。
