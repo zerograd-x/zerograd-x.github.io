@@ -1,75 +1,206 @@
-"""pip install torch
-python policy_gradient_demo.py --method 6 --episodes 300
-Six estimators, one finite-horizon on-policy toy environment.
-"""
+"""Six on-policy policy gradients. Install: pip install -r requirements.txt."""
 import argparse
+from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.distributions import Categorical
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--method', type=int, choices=range(1, 7), default=6)
-parser.add_argument('--episodes', type=int, default=300)
-args = parser.parse_args()
-torch.manual_seed(7)
-gamma, horizon = 0.9, 3
-# State is a one-hot time index (finite-horizon Markov state).
-def net(out):
+
+def mlp(out):
     return nn.Sequential(nn.Linear(3, 32), nn.Tanh(), nn.Linear(32, out))
-actor, value, qnet = net(2), net(1), net(2)
-actor_opt = torch.optim.Adam(actor.parameters(), lr=0.01)
-critic_opt = torch.optim.Adam(list(value.parameters()) + list(qnet.parameters()), lr=0.01)
-states = torch.eye(horizon)
-for episode in range(args.episodes):
-    # Complete fresh episode, with parameters fixed while collecting.
-    with torch.no_grad():
-        actions = Categorical(logits=actor(states)).sample()
-        # Action 1 has higher expected reward at every step.
-        rewards = (2 * actions.float() - 1) + 0.3 * torch.randn(horizon)
-        returns = torch.zeros(horizon)
-        running = 0.0
-        for t in reversed(range(horizon)):
-            running = rewards[t] + gamma * running
-            returns[t] = running
-    logp = Categorical(logits=actor(states)).log_prob(actions)
-    v = value(states).squeeze(-1)
-    q = qnet(states).gather(1, actions[:, None]).squeeze(1)
-    discounts = gamma ** torch.arange(horizon)
-    # All actor weights use the pre-update critic, detached below.
-    if args.method == 1:
-        weights = returns[0].expand(horizon)  # NO extra gamma**t
-    elif args.method == 2:
-        weights = discounts * returns
-    elif args.method == 3:
-        weights = discounts * (returns - v)
-    elif args.method == 4:
-        weights = discounts * q
-    elif args.method == 5:
-        weights = discounts * (q - v)
-    else:
-        # Last next state is truly terminal, so its value is zero.
-        target = rewards + gamma * torch.cat([v.detach()[1:], v.new_zeros(1)])
-        weights = discounts * (target - v)
-    actor_loss = -(weights.detach() * logp).sum()
-    actor_opt.zero_grad()
-    actor_loss.backward()
-    actor_opt.step()
-    # MC targets for methods 3–5; detached one-step TD target for 6.
-    critic_loss = None
-    if args.method in (3, 5):
-        critic_loss = 0.5 * (v - returns).square().mean()
-    if args.method in (4, 5):
-        q_loss = 0.5 * (q - returns).square().mean()
-        critic_loss = q_loss if critic_loss is None else critic_loss + q_loss
-    if args.method == 6:
-        critic_loss = 0.5 * (v - target.detach()).square().mean()
-    if critic_loss is not None:
-        critic_opt.zero_grad()
-        critic_loss.backward()
-        critic_opt.step()
-    if episode % 50 == 0 or episode == args.episodes - 1:
-        with torch.no_grad():
-            p = actor(states).softmax(-1)[:, 1].mean().item()
-        print(f'episode={episode:4d} mean P(action=1)={p:.3f}')
-# Educational example: one episode/update, no replay, no entropy bonus.
-# Approximate Q / TD critics can bias the actor gradient; convergence is not guaranteed.
+
+
+class Actor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = mlp(2)
+
+    def forward(self, states):
+        return Categorical(logits=self.net(states))
+
+
+class ValueCritic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = mlp(1)
+
+    def forward(self, states):
+        return self.net(states).squeeze(-1)
+
+
+class QCritic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = mlp(2)
+
+    def forward(self, states, actions):
+        return self.net(states).gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+
+
+class ToyEnv:
+    """Three-step finite-horizon task; time is part of the Markov state.
+
+    The horizon is a genuine task termination, not a sampler truncation.
+    Action 1 has larger expected reward. No Gym dependency.
+    """
+    def reset(self):
+        self.t = 0
+        return torch.eye(3)[0]
+
+    def step(self, action):
+        reward = 2.0 * action - 1.0 + 0.3 * torch.randn(()).item()
+        self.t += 1
+        terminated = self.t == 3
+        next_state = torch.zeros(3) if terminated else torch.eye(3)[self.t]
+        return next_state, reward, terminated, False
+
+
+@dataclass
+class Batch:
+    states: torch.Tensor
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    next_states: torch.Tensor
+    terminated: torch.Tensor
+    discounts: torch.Tensor
+    returns: torch.Tensor
+
+
+@torch.no_grad()
+def discounted_returns(rewards, gamma):
+    """Complete single episode only: G_t = r_t + gamma G_{t+1}."""
+    result = torch.zeros_like(rewards)
+    running = rewards.new_zeros(())
+    for t in reversed(range(len(rewards))):
+        running = rewards[t] + gamma * running
+        result[t] = running
+    return result
+
+
+@torch.no_grad()
+def rollout(actor, env, gamma):
+    """Freeze parameters, collect one fresh complete episode, never replay it."""
+    state = env.reset()
+    states, actions, rewards, next_states, ends = [], [], [], [], []
+    while True:
+        action = actor(state).sample()
+        next_state, reward, terminated, truncated = env.step(action.item())
+        # MC methods need the full suffix. Do not silently turn a truncation
+        # into a zero-tail MC target. A continuing-task adapter needs changes.
+        if truncated and not terminated:
+            raise ValueError('Incomplete episode: MC returns require a full suffix')
+        states.append(state)
+        actions.append(action)
+        rewards.append(reward)
+        next_states.append(next_state)
+        ends.append(terminated)
+        state = next_state
+        if terminated:
+            break
+    rewards = torch.tensor(rewards, dtype=torch.float32)
+    return Batch(torch.stack(states), torch.stack(actions), rewards,
+                 torch.stack(next_states), torch.tensor(ends),
+                 gamma ** torch.arange(len(rewards)),
+                 discounted_returns(rewards, gamma))
+
+
+@torch.no_grad()
+def td_target(batch, value, gamma):
+    # Only true termination masks bootstrap; evaluate no terminal observations.
+    next_v = torch.zeros_like(batch.rewards)
+    live = ~batch.terminated
+    next_v[live] = value(batch.next_states[live])
+    return batch.rewards + gamma * next_v
+
+
+def mse(prediction, target):
+    return 0.5 * (prediction - target.detach()).square().mean()
+
+
+def method_1(b, value, qnet, gamma):
+    weights = b.returns[0].expand_as(b.returns)  # No extra gamma**t.
+    return weights, None
+
+
+def method_2(b, value, qnet, gamma):
+    weights = b.discounts * b.returns
+    return weights, None
+
+
+def method_3(b, value, qnet, gamma):
+    v = value(b.states)  # Pre-update, action-independent baseline.
+    weights = b.discounts * (b.returns - v)
+    return weights, mse(v, b.returns)  # MC V target.
+
+
+def method_4(b, value, qnet, gamma):
+    q = qnet(b.states, b.actions)
+    weights = b.discounts * q
+    return weights, mse(q, b.returns)  # MC Q^pi target, no max/DQN.
+
+
+def method_5(b, value, qnet, gamma):
+    q, v = qnet(b.states, b.actions), value(b.states)
+    weights = b.discounts * (q - v)
+    return weights, mse(q, b.returns) + mse(v, b.returns)
+
+
+def method_6(b, value, qnet, gamma):
+    v = value(b.states)
+    y = td_target(b, value, gamma)  # no_grad: entire TD target is constant.
+    weights = b.discounts * (y - v)
+    return weights, mse(v, y)  # One-step TD semi-gradient.
+
+
+METHODS = [method_1, method_2, method_3, method_4, method_5, method_6]
+
+
+def actor_loss(actor, batch, weights):
+    # Sum within an episode. For B episodes: sum their losses / B.
+    # Do not backpropagate into Q, V, targets, sampling, or the environment.
+    return -(weights.detach() * actor(batch.states).log_prob(batch.actions)).sum()
+
+
+def train(method=6, episodes=300, gamma=0.9, seed=7, verbose=True):
+    if method not in range(1, 7) or episodes < 1 or not 0 <= gamma <= 1:
+        raise ValueError('method: 1..6; episodes >= 1; gamma: 0..1')
+    torch.manual_seed(seed)
+    actor = Actor()
+    value = ValueCritic() if method in (3, 5, 6) else None
+    qnet = QCritic() if method in (4, 5) else None
+    actor_opt = torch.optim.Adam(actor.parameters(), lr=0.01)
+    critic_params = [p for net in (value, qnet) if net is not None
+                     for p in net.parameters()]
+    critic_opt = torch.optim.Adam(critic_params, lr=0.01) if critic_params else None
+    env = ToyEnv()
+    for episode in range(episodes):
+        b = rollout(actor, env, gamma)
+        # Both losses use pre-update predictions. No fitting before weighting.
+        weights, critic_loss = METHODS[method - 1](b, value, qnet, gamma)
+        loss = actor_loss(actor, b, weights)
+        if not torch.isfinite(loss) or (critic_loss is not None and
+                                       not torch.isfinite(critic_loss)):
+            raise FloatingPointError('Non-finite loss')
+        actor_opt.zero_grad(set_to_none=True)
+        loss.backward()
+        actor_opt.step()
+        if critic_opt is not None:
+            critic_opt.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            critic_opt.step()
+        # Discard b, collect again with the updated policy.
+        if verbose and (episode % 50 == 0 or episode == episodes - 1):
+            with torch.no_grad():
+                p = actor(torch.eye(3)).probs[:, 1].mean().item()
+            print(f'method={method} episode={episode:4d} mean P(action=1)={p:.3f}')
+    return actor, value, qnet
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--method', type=int, choices=range(1, 7), default=6)
+    parser.add_argument('--episodes', type=int, default=300)
+    parser.add_argument('--gamma', type=float, default=0.9)
+    parser.add_argument('--seed', type=int, default=7)
+    args = parser.parse_args()
+    train(**vars(args))

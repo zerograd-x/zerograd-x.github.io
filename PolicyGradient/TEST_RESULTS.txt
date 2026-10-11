@@ -1,0 +1,21 @@
+Python 3.14 / PyTorch 2.14.1 / CPU / seed 7
+test_actor_gradient_isolation_and_critic_update (test_policy_gradient.Tests.test_actor_gradient_isolation_and_critic_update) ... ok
+test_exact_expected_gradients_all_six (test_policy_gradient.Tests.test_exact_expected_gradients_all_six) ... ok
+test_method_weights_and_targets (test_policy_gradient.Tests.test_method_weights_and_targets) ... ok
+test_reject_incomplete_mc (test_policy_gradient.Tests.test_reject_incomplete_mc) ... ok
+test_returns_and_gamma_edges (test_policy_gradient.Tests.test_returns_and_gamma_edges) ... ok
+test_terminal_mask_and_target_detach (test_policy_gradient.Tests.test_terminal_mask_and_target_detach) ... ok
+test_training_all_methods (test_policy_gradient.Tests.test_training_all_methods) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 2.122s
+
+OK
+method 1: P(action=1)=0.9997
+method 2: P(action=1)=0.9997
+method 3: P(action=1)=0.9999
+method 4: P(action=1)=0.9999
+method 5: P(action=1)=0.9995
+method 6: P(action=1)=1.0000
+
+Browser QA: six method panels, negative advantage, downloaded source equality, 390px layout, no JS console errors: PASS
