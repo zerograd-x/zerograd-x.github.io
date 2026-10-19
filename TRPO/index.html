@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TRPO · 从 Rollout 到安全更新</title>
+<style>
+:root{--bg:#f4f3ed;--ink:#18352e;--muted:#61736a;--line:#d4ddd3;--accent:#177b5a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}
+header{padding:18px 5%;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px}a{color:var(--accent)}
+main{max-width:1040px;margin:auto;padding:44px 22px 80px}h1{font-size:clamp(38px,6vw,64px);line-height:1.2;margin:10px 0 24px}h2{margin-top:54px;font-size:27px}
+p{max-width:850px}.lead{font-size:19px;color:var(--muted)}.eyebrow{color:var(--accent);letter-spacing:2px;font-size:12px;font-weight:700}
+.card{padding:25px;background:#fffefa;border:1px solid var(--line);border-radius:18px;margin:18px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.flow{text-align:center;line-height:2.3;background:#e7f0e7;border-radius:14px;padding:22px}
+code{background:#e7efea;padding:2px 5px;border-radius:4px}pre{background:#132b24;color:#d6eadd;padding:22px;border-radius:14px;overflow-x:auto;line-height:1.7;font-size:13px}
+input[type=range]{accent-color:var(--accent);width:230px}.value{font-variant-numeric:tabular-nums;font-weight:700}.row{display:flex;align-items:center;flex-wrap:wrap;gap:20px}
+.result{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.result div{background:#e8f0e7;padding:14px;border-radius:10px}
+small,.muted{color:var(--muted)}details{border-bottom:1px solid var(--line);padding:17px 0}summary{cursor:pointer;font-weight:600}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:12px;text-align:left}
+footer{border-top:1px solid var(--line);margin-top:70px;padding-top:20px}
+@media(max-width:670px){.grid,.result{grid-template-columns:1fr}main{padding:30px 16px}}
+</style></head>
+<body><header><b>RL / TRPO 实验笔记</b><nav><a href="/">首页</a> · <a href="/PolicyGradient/">Policy Gradient</a></nav></header>
+<main>
+<div class="eyebrow">07 / TRUST REGION POLICY OPTIMIZATION</div>
+<h1>知道往哪走，<br>还要知道走多远。</h1>
+<p class="lead">TRPO 没有神秘的新奖励。Rollout 和 Advantage 仍然告诉 Actor 哪些动作值得强化；真正不同的是：更新权重时，TRPO 会先考虑新旧 Policy 的差异，再决定更新方向与幅度。</p>
+<div class="grid"><div class="card"><b>普通 Policy Gradient + Adam</b><p>Rollout → Advantage → Gradient → Adam 更新 Weight。</p><p>Learning Rate 调节参数步长，但不能直接保证输出的动作概率变化很小。</p></div><div class="card"><b>TRPO</b><p>Rollout → Advantage → Gradient → 根据 KL 调整方向 → 检查 KL → 更新 Weight。</p><p>不是简单的“KL 超标就丢弃 Rollout”，而是先缩小候选参数更新。</p></div></div>
+<h2>01 · 把一轮训练走完</h2>
+<div class="flow"><b>旧 Policy π_old</b><br>↓<br>采集 Rollout，得到 reward 和 action<br>↓<br>Critic 估计 Advantage（常用 GAE）<br>↓<br>计算 Surrogate Objective 的梯度 g<br>↓<br>利用 KL 二阶信息求调整后的方向（Conjugate Gradient）<br>↓<br>生成候选 Weight Update<br>↓<br>Line Search：KL 够小，并且 Objective 改善吗？<br>↓<br>接受更新 / 缩小步长重试 / 保留旧参数<br>↓<br><b>新 Policy → 收集新 Rollout</b></div>
+<p><b>特别注意执行顺序：</b>计算梯度时还没有更新 Actor，所以当前与旧 Policy 相同，probability ratio 等于 1；但 ratio 对 Weight 的导数不为零。等得到 Candidate Weights，ratio 才可能偏离 1。</p>
+<h2>02 · 为什么同时保存 old_log_probs 和 old_action_dists？</h2>
+<div class="card"><p><code>old_log_probs</code>：只保存<strong>实际采样到的 Action</strong> 在旧 Policy 下的 log probability，用于 Importance Ratio。</p>
+<p><code>old_action_dists</code>：保存每个 State 下<strong>所有 Action 的概率分布</strong>，用于计算 KL。</p>
+<pre>old_dist = Categorical(probs=actor(states).detach())
+old_log_probs = old_dist.log_prob(actions)</pre>
+<p>两个值可以从同一次 Actor Forward 得到，不必重复跑两次网络。</p></div>
+<h2>03 · 一个数字例子：Ratio 用来优化，KL 用来约束</h2>
+<div class="card">
+<p>假设旧 Policy 对两个 Action 的概率是 <b>[0.6, 0.4]</b>。我们尝试提高第一个 Action 的概率。调整滑块，看看它的样本 Ratio 和整个概率分布的 KL 如何一起改变。</p>
+<div class="row"><label for="pnew">候选 Policy 的 P(Action 0)</label><input id="pnew" type="range" min=".01" max=".99" value=".7" step=".01"><span id="pout" class="value">0.70</span></div>
+<div class="result"><div><small>Importance Ratio（采样 Action 0）</small><br><span class="value" id="ratio">1.167</span></div><div><small>KL(old || candidate)</small><br><span class="value" id="kl">0.023</span></div><div><small>候选 KL ≤ 0.03？</small><br><span class="value" id="accept">是</span></div></div>
+<p class="muted">这里仅演示一个 State 的概率变化。TRPO 实际检查多个采样 State 的平均 KL，并且还需要 Surrogate Objective 改善才会接受更新。</p></div>
+<h2>04 · 对照你看的 TRPO 代码</h2>
+<table><thead><tr><th>函数</th><th>究竟在做什么</th><th>会更新 Actor Weight 吗？</th></tr></thead><tbody>
+<tr><td><code>compute_surrogate_obj</code></td><td>为旧 Rollout 计算 ratio × advantage 的平均值</td><td>不会</td></tr>
+<tr><td><code>autograd.grad</code></td><td>在旧参数处求出 Policy Gradient</td><td>不会</td></tr>
+<tr><td><code>hessian_matrix_vector_product</code></td><td>用 KL 的二阶信息计算 H 与向量的乘积</td><td>不会</td></tr>
+<tr><td><code>conjugate_gradient</code></td><td>求解 Hx=g，寻找对概率分布更稳妥的方向</td><td>不会</td></tr>
+<tr><td><code>line_search</code></td><td>尝试候选权重；检查目标是否提高、KL 是否合格</td><td>只评估副本</td></tr>
+<tr><td><code>vector_to_parameters</code></td><td>将被接受的参数写回 Actor</td><td><b>会</b></td></tr>
+</tbody></table>
+<h2>05 · 只留两个必要公式</h2>
+<div class="grid"><div class="card"><b>优化信号</b><pre>ratio = exp(new_logp - old_logp)
+objective = mean(ratio * advantage)</pre><p>Advantage 为正，希望增加该 Action 概率；为负，希望减少。旧参数处 ratio=1，但仍然可求梯度。</p></div>
+<div class="card"><b>更新约束</b><pre>candidate = old_weights + step
+accept if (
+    objective_improves
+    and mean_kl <= threshold
+)</pre><p>这两项只是直觉级伪代码。实际 TRPO 的 step 来自 KL 二阶近似和 Conjugate Gradient，并通过 Backtracking 缩小。</p></div></div>
+<h2>06 · KL 和 Learning Rate 到底什么关系？</h2>
+<p><b>标准 TRPO 不依赖普通 Adam Learning Rate 更新 Actor。</b>它先利用 KL Hessian 改变梯度方向，再根据 KL Threshold 缩放候选步长。<code>line_search</code> 中的 <code>alpha</code> 是步长缩减因子，不是 Adam 的 Learning Rate。Critic 仍然可以使用 Adam。</p>
+<details><summary>展开：为什么不能只检查 KL，还是需要 Hessian？</summary><p>两个 Weight 的梯度可能相同，但它们改变 Action Probability 的敏感度不同。KL Hessian 告诉 TRPO 哪些组合会让 Policy 改变得更剧烈。它还能表示不同参数之间的耦合，因此更新方向不一定与原始梯度平行。Line Search 负责最终验收。</p></details>
+<details><summary>展开：GAE 的 gamma 与 lambda 各做什么？</summary><p><b>Gamma</b> 定义未来 Reward 的折扣，因此也定义优化目标。<b>Lambda</b> 只改变 Advantage 估计中真实后续奖励与 Critic 预测的折中。减小 gamma 会改变任务偏好；减小 lambda 不等价于改变 gamma。</p></details>
+<details><summary>展开：为什么说 TRPO 比 PPO 更“严格”？</summary><p>TRPO 显式检查候选更新的平均 KL，并使用受约束的二阶近似来选步长。PPO-Clip 通常用 Adam 优化 clipped surrogate，并可选择监控 KL 或提前停止。PPO 的 clipping 本身并不严格保证 KL 阈值不被超过。TRPO 对平均 KL 的检查也不等于每个 State 都得到严格的理论保证。</p></details>
+<h2>07 · 建议学习顺序</h2><p>先理解 <strong>Ratio 在旧参数处为 1 但梯度不为零</strong>，再理解 <strong>KL Hessian 改变方向</strong>，最后理解 <strong>Line Search 只在满足 KL 且 Objective 改善时接受参数</strong>。理解这三个点，TRPO 的执行顺序就清楚了。</p>
+<footer>继续学习：<a href="/PolicyGradient/">六种 Policy Gradient 学习信号</a> · <a href="https://spinningup.openai.com/en/latest/algorithms/trpo.html">OpenAI Spinning Up · TRPO</a></footer>
+</main><script>
+const slider=document.getElementById('pnew');
+function update(){const p=Number(slider.value),q=1-p;
+const kl=.6*Math.log(.6/p)+.4*Math.log(.4/q);
+document.getElementById('pout').textContent=p.toFixed(2);
+document.getElementById('ratio').textContent=(p/.6).toFixed(3);
+document.getElementById('kl').textContent=kl.toFixed(4);
+document.getElementById('accept').textContent=kl<=.03?'是（还需目标改善）':'否（需要缩小步长）';}
+slider.addEventListener('input',update);update();
+</script></body></html>
