@@ -1,198 +1,152 @@
-<!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TRPO · 从 Rollout 到安全更新</title>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TRPO · 按训练步骤一步步学</title>
 <style>
-:root{--bg:#f4f3ed;--ink:#18352e;--muted:#61736a;--line:#d4ddd3;--accent:#177b5a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}
-header{padding:18px 5%;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px}a{color:var(--accent)}
-main{max-width:1040px;margin:auto;padding:44px 22px 80px}h1{font-size:clamp(38px,6vw,64px);line-height:1.2;margin:10px 0 24px}h2{margin-top:54px;font-size:27px}
-p{max-width:850px}.lead{font-size:19px;color:var(--muted)}.eyebrow{color:var(--accent);letter-spacing:2px;font-size:12px;font-weight:700}
-.card{padding:25px;background:#fffefa;border:1px solid var(--line);border-radius:18px;margin:18px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.flow{text-align:center;line-height:2.3;background:#e7f0e7;border-radius:14px;padding:22px}
-code{background:#e7efea;padding:2px 5px;border-radius:4px}pre{background:#132b24;color:#d6eadd;padding:22px;border-radius:14px;overflow-x:auto;line-height:1.7;font-size:13px}
-input[type=range]{accent-color:var(--accent);width:230px}.value{font-variant-numeric:tabular-nums;font-weight:700}.row{display:flex;align-items:center;flex-wrap:wrap;gap:20px}
-.result{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.result div{background:#e8f0e7;padding:14px;border-radius:10px}
-small,.muted{color:var(--muted)}details{border-bottom:1px solid var(--line);padding:17px 0}summary{cursor:pointer;font-weight:600}
-table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:12px;text-align:left}
-footer{border-top:1px solid var(--line);margin-top:70px;padding-top:20px}
-@media(max-width:670px){.grid,.result{grid-template-columns:1fr}main{padding:30px 16px}}
-</style></head>
-<body><header><b>RL / TRPO 实验笔记</b><nav><a href="/">首页</a> · <a href="/PolicyGradient/">Policy Gradient</a></nav></header>
-<main>
-<div class="eyebrow">07 / TRUST REGION POLICY OPTIMIZATION</div>
-<h1>知道往哪走，<br>还要知道走多远。</h1>
-<p class="lead">TRPO 没有神秘的新奖励。Rollout 和 Advantage 仍然告诉 Actor 哪些动作值得强化；真正不同的是：更新权重时，TRPO 会先考虑新旧 Policy 的差异，再决定更新方向与幅度。</p>
-<div class="grid"><div class="card"><b>普通 Policy Gradient + Adam</b><p>Rollout → Advantage → Gradient → Adam 更新 Weight。</p><p>Learning Rate 调节参数步长，但不能直接保证输出的动作概率变化很小。</p></div><div class="card"><b>TRPO</b><p>Rollout → Advantage → Gradient → 根据 KL 调整方向 → 检查 KL → 更新 Weight。</p><p>不是简单的“KL 超标就丢弃 Rollout”，而是先缩小候选参数更新。</p></div></div>
-<h2>01 · 把一轮训练走完</h2>
-<div class="flow"><b>旧 Policy π_old</b><br>↓<br>采集 Rollout，得到 reward 和 action<br>↓<br>Critic 估计 Advantage（常用 GAE）<br>↓<br>计算 Surrogate Objective 的梯度 g<br>↓<br>利用 KL 二阶信息求调整后的方向（Conjugate Gradient）<br>↓<br>生成候选 Weight Update<br>↓<br>Line Search：KL 够小，并且 Objective 改善吗？<br>↓<br>接受更新 / 缩小步长重试 / 保留旧参数<br>↓<br><b>新 Policy → 收集新 Rollout</b></div>
-<p><b>特别注意执行顺序：</b>计算梯度时还没有更新 Actor，所以当前与旧 Policy 相同，probability ratio 等于 1；但 ratio 对 Weight 的导数不为零。等得到 Candidate Weights，ratio 才可能偏离 1。</p>
-<h2>02 · 为什么同时保存 old_log_probs 和 old_action_dists？</h2>
-<div class="card"><p><code>old_log_probs</code>：只保存<strong>实际采样到的 Action</strong> 在旧 Policy 下的 log probability，用于 Importance Ratio。</p>
-<p><code>old_action_dists</code>：保存每个 State 下<strong>所有 Action 的概率分布</strong>，用于计算 KL。</p>
-<pre>old_dist = Categorical(probs=actor(states).detach())
-old_log_probs = old_dist.log_prob(actions)</pre>
-<p>两个值可以从同一次 Actor Forward 得到，不必重复跑两次网络。</p></div>
-<h2>03 · 一个数字例子：Ratio 用来优化，KL 用来约束</h2>
-<div class="card">
-<p>假设旧 Policy 对两个 Action 的概率是 <b>[0.6, 0.4]</b>。我们尝试提高第一个 Action 的概率。调整滑块，看看它的样本 Ratio 和整个概率分布的 KL 如何一起改变。</p>
-<div class="row"><label for="pnew">候选 Policy 的 P(Action 0)</label><input id="pnew" type="range" min=".01" max=".99" value=".7" step=".01"><span id="pout" class="value">0.70</span></div>
-<div class="result"><div><small>Importance Ratio（采样 Action 0）</small><br><span class="value" id="ratio">1.167</span></div><div><small>KL(old || candidate)</small><br><span class="value" id="kl">0.023</span></div><div><small>候选 KL ≤ 0.03？</small><br><span class="value" id="accept">是</span></div></div>
-<p class="muted">这里仅演示一个 State 的概率变化。TRPO 实际检查多个采样 State 的平均 KL，并且还需要 Surrogate Objective 改善才会接受更新。</p></div>
-<h2>04 · 对照你看的 TRPO 代码</h2>
-<table><thead><tr><th>函数</th><th>究竟在做什么</th><th>会更新 Actor Weight 吗？</th></tr></thead><tbody>
-<tr><td><code>compute_surrogate_obj</code></td><td>为旧 Rollout 计算 ratio × advantage 的平均值</td><td>不会</td></tr>
-<tr><td><code>autograd.grad</code></td><td>在旧参数处求出 Policy Gradient</td><td>不会</td></tr>
-<tr><td><code>hessian_matrix_vector_product</code></td><td>用 KL 的二阶信息计算 H 与向量的乘积</td><td>不会</td></tr>
-<tr><td><code>conjugate_gradient</code></td><td>求解 Hx=g，寻找对概率分布更稳妥的方向</td><td>不会</td></tr>
-<tr><td><code>line_search</code></td><td>尝试候选权重；检查目标是否提高、KL 是否合格</td><td>只评估副本</td></tr>
-<tr><td><code>vector_to_parameters</code></td><td>将被接受的参数写回 Actor</td><td><b>会</b></td></tr>
-</tbody></table>
-<h2>05 · 只留两个必要公式</h2>
-<div class="grid"><div class="card"><b>优化信号</b><pre>ratio = exp(new_logp - old_logp)
-objective = mean(ratio * advantage)</pre><p>Advantage 为正，希望增加该 Action 概率；为负，希望减少。旧参数处 ratio=1，但仍然可求梯度。</p></div>
-<div class="card"><b>更新约束</b><pre>candidate = old_weights + step
-accept if (
-    objective_improves
-    and mean_kl <= threshold
-)</pre><p>这两项只是直觉级伪代码。实际 TRPO 的 step 来自 KL 二阶近似和 Conjugate Gradient，并通过 Backtracking 缩小。</p></div></div>
-<h2>06 · KL 和 Learning Rate 到底什么关系？</h2>
-<p><b>标准 TRPO 不依赖普通 Adam Learning Rate 更新 Actor。</b>它先利用 KL Hessian 改变梯度方向，再根据 KL Threshold 缩放候选步长。<code>line_search</code> 中的 <code>alpha</code> 是步长缩减因子，不是 Adam 的 Learning Rate。Critic 仍然可以使用 Adam。</p>
-<details><summary>展开：为什么不能只检查 KL，还是需要 Hessian？</summary><p>两个 Weight 的梯度可能相同，但它们改变 Action Probability 的敏感度不同。KL Hessian 告诉 TRPO 哪些组合会让 Policy 改变得更剧烈。它还能表示不同参数之间的耦合，因此更新方向不一定与原始梯度平行。Line Search 负责最终验收。</p></details>
-<details><summary>展开：GAE 的 gamma 与 lambda 各做什么？</summary><p><b>Gamma</b> 定义未来 Reward 的折扣，因此也定义优化目标。<b>Lambda</b> 只改变 Advantage 估计中真实后续奖励与 Critic 预测的折中。减小 gamma 会改变任务偏好；减小 lambda 不等价于改变 gamma。</p></details>
-<details><summary>展开：为什么说 TRPO 比 PPO 更“严格”？</summary><p>TRPO 显式检查候选更新的平均 KL，并使用受约束的二阶近似来选步长。PPO-Clip 通常用 Adam 优化 clipped surrogate，并可选择监控 KL 或提前停止。PPO 的 clipping 本身并不严格保证 KL 阈值不被超过。TRPO 对平均 KL 的检查也不等于每个 State 都得到严格的理论保证。</p></details>
-<h2>07 · 建议学习顺序</h2><p>先理解 <strong>Ratio 在旧参数处为 1 但梯度不为零</strong>，再理解 <strong>KL Hessian 改变方向</strong>，最后理解 <strong>Line Search 只在满足 KL 且 Objective 改善时接受参数</strong>。理解这三个点，TRPO 的执行顺序就清楚了。</p>
+:root{--bg:#f4f3ed;--ink:#18352e;--line:#d4ddd3;--muted:#61736a;--accent:#177b5a}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}header{border-bottom:1px solid var(--line);padding:17px 5%;display:flex;justify-content:space-between;gap:15px}a{color:var(--accent)}main{max-width:1080px;margin:auto;padding:40px 22px 80px}h1{font-size:clamp(36px,5vw,60px);line-height:1.2;margin:12px 0}h2{font-size:28px;margin:0 0 14px}h3{font-size:19px;margin:24px 0 8px}p{margin:9px 0 16px}.lead{font-size:19px;color:var(--muted)}.eyebrow{font-size:12px;letter-spacing:2px;color:var(--accent);font-weight:700}.step{scroll-margin-top:24px;background:#fffefa;border:1px solid var(--line);border-radius:18px;padding:28px;margin:24px 0}.step>.eyebrow{margin-bottom:9px}.data{background:#eaf1e9;padding:13px 17px;border-radius:10px;margin:15px 0}.status{background:#f3ede0;border-left:3px solid #b77a38;padding:12px 16px;margin:15px 0;font-size:14px}.row{display:flex;gap:22px;flex-wrap:wrap;align-items:center}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.mini{background:#eaf1e9;padding:14px;border-radius:10px}pre{background:#132b24;color:#d6eadd;padding:19px;border-radius:12px;overflow:auto;font:13px/1.65 ui-monospace,monospace}code{background:#e9efea;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:10px;text-align:left;border-bottom:1px solid var(--line)}input[type=range]{accent-color:var(--accent);width:230px}nav{display:flex;gap:12px;flex-wrap:wrap}nav a{text-decoration:none;font-size:13px}details{padding:15px 0;border-bottom:1px solid var(--line)}summary{font-weight:700;cursor:pointer}footer{border-top:1px solid var(--line);margin-top:55px;padding-top:20px}button{background:var(--ink);color:white;border:0;padding:9px 16px;border-radius:8px;cursor:pointer}.toc a{display:inline-block;margin:3px 12px 3px 0}.small{font-size:14px;color:var(--muted)}@media(max-width:680px){main{padding:25px 14px}.grid{grid-template-columns:1fr}.step{padding:19px}header{padding:12px}}
+</style></head><body><header><b>RL / TRPO · Train Step</b><nav><a href="/">首页</a><a href="/PolicyGradient/">Policy Gradient</a></nav></header>
+<main><div class="eyebrow">ONE UPDATE AT A TIME</div><h1>TRPO：沿着一次训练，<br>看 Weight 怎么更新。</h1><p class="lead">不先背算法公式。假设我们已经有一个 Actor 和一个 Critic，下面严格按照一次 <code>update(transition_dict)</code> 的执行顺序来讲：输入是什么、执行哪段代码、得到什么、哪些 Weight 真正变了。</p>
+<div class="data"><b>先记住：</b>一轮 TRPO 中，Actor 只在最后接受候选参数时才真正更新。Critic 通过 Adam 单独更新。KL 不是决定丢不丢 Rollout，而是限制这轮 Actor 可以改变多少。</div>
+<div class="toc"><b>本轮执行顺序：</b><br><a href="#step0">0. 初始网络</a><a href="#step1">1. Rollout</a><a href="#step2">2. TD & GAE</a><a href="#step3">3. 冻结旧概率</a><a href="#step4">4. Critic Adam</a><a href="#step5">5. Surrogate Gradient</a><a href="#step6">6. KL Hessian</a><a href="#step7">7. CG</a><a href="#step8">8. Candidate Step</a><a href="#step9">9. Line Search</a><a href="#step10">10. 写回 Actor</a></div>
 
-<section id="walkthrough">
-<h2>08 · 手算一次 TRPO：从 3 个 Action 到 Weight</h2>
-<p>先固定一个 State，旧 Policy 对三个动作的概率为 [0.5, 0.3, 0.2]。Rollout 已经采好，并通过 Critic 计算出 Advantage。这个小例子是帮助理解，不代表真实网络只有一个 State。</p>
-<div class="card"><table><thead><tr><th>采样 Action</th><th>旧概率</th><th>Advantage</th><th>更新希望发生什么</th></tr></thead><tbody><tr><td>A</td><td>0.50</td><td>+2</td><td>提高概率</td></tr><tr><td>B</td><td>0.30</td><td>−1</td><td>降低概率</td></tr><tr><td>C</td><td>0.20</td><td>−3</td><td>降低概率</td></tr></tbody></table>
-<p>只要记住：<b>Advantage 决定动作的好坏；梯度告诉我们应如何修改网络 Weight。</b> 不能直接逐项修改表格中的 Action Probability，因为它们都是共享网络参数经 Softmax 产生的。</p></div>
-<h2>09 · 先算 Ratio，再算 Gradient：时间顺序一点也不矛盾</h2>
-<div class="card">
-<p><b>时刻 A（刚采完 Rollout）</b>：<code>old_log_probs</code> 来自旧策略，保存下来并 <code>detach</code>。此时当前 Actor 参数也等于旧参数，所以 Ratio 对每个采样 Action 都是 1。</p>
-<p><b>时刻 B（求 Gradient）</b>：我们对“若 Weight 稍微变化，Ratio 会怎样变化”求导。<b>当前 Ratio=1，不意味着 Ratio 的斜率=0。</b></p>
-<pre># old_log_probs 不随优化参数改变
-current_logp = actor(states).log_prob(actions)
-ratio = (current_logp - old_log_probs).exp()  # 初始值约为 1
-objective = (ratio * advantages).mean()
-g = torch.autograd.grad(objective, actor.parameters())
-# 这里只求梯度，没有执行 optimizer.step()，Weight 不变</pre>
-<p><b>时刻 C（尝试 Candidate）</b>：把暂时算出的新 Weight 放进 Actor 副本。再次计算 Ratio，它才可能从 1 变成 1.2 或 0.8。此时用于检查“改完是否更好”，而不是重新生成 Rollout。</p>
-</div>
-<h2>10 · Critic 和 GAE：为什么先有 Advantage 才能优化 Actor？</h2>
-<p>Critic 预测从 State 出发的未来 Return；它不负责选择 Action。Rollout 的每一步都有 Reward，而 Critic 会对当前 State 和下一 State 给出预测。</p>
-<div class="card">
-<pre># 一个非终止 Transition
-reward = 1.0
-gamma = 0.9
-value_now = 4.0
-value_next = 5.0
-td_error = reward + gamma * value_next - value_now  # 1.5</pre>
-<p>1-step TD Error 可以直接当作 Advantage 的估计，但会依赖 Critic 的准确性。GAE 从后往前累加 TD Error：越远的 TD Error，权重通常越低。</p>
-<div class="row"><label>GAE λ <input id="lambdaRange" type="range" min="0" max="1" step=".05" value=".95"></label><strong id="lambdaValue">0.95</strong></div>
-<p>假设三个连续 TD Error 为 [1, 2, 3]，γ=0.9：初始时间步的 GAE Advantage = <strong id="gaeValue"></strong>。</p>
-<p class="muted">λ=0 只依赖当前 TD Error；λ=1 在完整终止 Episode 下相当于 Monte Carlo Return 减去当前 Value。γ 定义长期奖励的折扣，λ 决定 Advantage 估计有多依赖较远的实际观测。</p>
-</div>
-<h2>11 · 为什么要用 KL Hessian，而不是只用 Learning Rate？</h2>
-<p>假设两个 Weight 的 Policy Gradient 都是 1。普通 SGD 倾向于同时增加它们。但其中一个 Weight 的轻微变化可能让输出概率剧烈变化，另一个 Weight 则不敏感。</p>
-<div class="card">
-<p>为方便手算，设 Gradient 为 <b>[1, 1]</b>，KL Hessian 是一个对角矩阵，对角线为 <b>[100, 1]</b>。</p>
-<table><thead><tr><th>参数</th><th>原始 Gradient</th><th>KL 敏感程度</th><th>调整后的方向</th></tr></thead><tbody><tr><td>w₁</td><td>1</td><td>100（敏感）</td><td>0.01</td></tr><tr><td>w₂</td><td>1</td><td>1（不敏感）</td><td>1</td></tr></tbody></table>
-<p>这就是为什么 TRPO 的方向可能不同于普通梯度：<b>它试图用有限的 Policy Distribution Change 换取更多的 Objective Improvement。</b> 实际 Hessian 还含有非对角项，因此参数之间可能互相影响。</p>
-</div>
-<h2>12 · Hessian-vector Product 到底计算了什么？</h2>
-<p>如果 Actor 有百万参数，完整 Hessian 就有万亿个元素，没有必要把它保存下来。TRPO 只需要一个服务：给它向量 <code>v</code>，返回 <code>H @ v</code>。</p>
-<pre>def hvp(actor, states, old_dist, vector):
-    new_dist = actor(states)
-    kl = kl_divergence(old_dist, new_dist).mean()
-    first = torch.autograd.grad(
-        kl, actor.parameters(), create_graph=True
-    )
-    flat_first = torch.cat([x.reshape(-1) for x in first])
-    directional_derivative = (flat_first * vector).sum()
-    second = torch.autograd.grad(
-        directional_derivative, actor.parameters()
-    )
-    return torch.cat([x.reshape(-1) for x in second])</pre>
-<p>第一次求导得到 KL 的 Gradient；与给定向量做点积；再求一次导就得到 <code>H @ v</code>。这并没有修改 Actor 参数。示例假设 <code>actor(states)</code> 返回分布对象。</p>
-<h2>13 · Conjugate Gradient（CG）在做什么？</h2>
-<p>我们已经有 Policy Gradient <code>g</code>，希望得到经过 KL 调整的方向 <code>x</code>，满足 <code>H x = g</code>。CG 不是更新神经网络的 Optimizer；它只是在<b>求一个线性方程的近似解</b>。</p>
-<div class="card">
-<p><b>初始</b>：x=0，Residual r=g，意思是还没有满足 Hx=g。</p>
-<p><b>每轮</b>：调用 HVP 得到 Hp；根据 Residual 选择搜索步长；改进 x；重新计算 Residual。</p>
-<p><b>结束</b>：Residual 足够小，或达到迭代上限，返回方向 x。真实实现通常对 HVP 加 Damping，并处理数值异常。</p>
-<pre>x = zeros_like(g)
-r = g.clone()
-p = r.clone()
-for iteration in range(10):
-    Hp = hvp(p)               # 不构造完整 H
-    step = dot(r, r) / dot(p, Hp)
-    x = x + step * p
-    r_new = r - step * Hp
-    if dot(r_new, r_new) < tolerance:
-        break
-    p = r_new + (dot(r_new, r_new) / dot(r, r)) * p
-    r = r_new
-# x 是方向，不是已经更新好的网络</pre>
-</div>
-<h2>14 · Candidate Step 与 Line Search：什么时候真正改 Weight？</h2>
-<p>有了 CG 返回的方向，还不能直接改 Weight。首先按 KL Threshold 缩放这个方向，形成<b>候选步长</b>，再用 Line Search 在 Actor 副本上试验。</p>
-<div class="card">
-<p>假设当前 Weight 是 <code>[0.50, 0.20]</code>，Candidate Step 是 <code>[0.02, 0.10]</code>，Line Search 缩减系数为 0.5。</p>
-<div class="row"><label>尝试保留候选 Step 的比例 <input id="stepRange" type="range" min="0" max="4" step="1" value="0"></label><b id="stepLabel">100%</b></div>
-<div class="result"><div><small>候选 w₁</small><br><b id="w1"></b></div><div><small>候选 w₂</small><br><b id="w2"></b></div><div><small>接下来做什么？</small><br>评估 KL 和 Objective</div></div>
-<p>如果平均 KL 超标，或者 Surrogate Objective 没有改善，就缩小 Step 再试。<b>只有 Accept Update 后</b>才把最终参数写入真正的 Actor；全部候选都失败则保留原 Weight。</p>
-</div>
-<h2>15 · 对应 PyTorch：从 update 到最终写回参数</h2>
-<p>下列代码仅保留顺序和关键变量；<code>gaes</code>、<code>fvp</code>、<code>conjugate_gradient</code> 和 <code>line_search</code> 的完整实现沿用上面各节。它是带注释的流程骨架，不是独立可运行的训练脚本。</p>
-<pre># (1) rollout 已经由 old actor 收集
-with torch.no_grad():
-    old_dist = Categorical(probs=actor(states))
-    old_logp = old_dist.log_prob(actions)
-    advantages = gaes(rewards, values, dones, gamma, lam)
+<section class="step" id="step0"><div class="eyebrow">TRAIN STEP 00</div><h2>准备：两个网络，两个参数集合</h2>
+<div class="grid"><div class="mini"><b>Actor θ</b><br>输入 State，输出所有 Action 的概率。例如 [0.6, 0.4]。负责采样 Action。</div><div class="mini"><b>Critic φ</b><br>输入 State，输出一个 Value。例如 4.0。负责估计未来 Return。</div></div>
+<pre>self.actor = PolicyNet(...).to(device)
+self.critic = ValueNet(...).to(device)
+self.critic_optimizer = torch.optim.Adam(
+    self.critic.parameters(), lr=critic_lr
+)</pre>
+<div class="status"><b>Weight 状态：</b>Actor θ 未更新；Critic φ 未更新。Actor 不使用 Adam，Critic 使用 Adam。</div></section>
 
-# (2) 当前 actor == rollout 时的 actor；ratio 约为 1
-new_logp = Categorical(probs=actor(states)).log_prob(actions)
-ratio = (new_logp - old_logp).exp()
-objective = (ratio * advantages).mean()
+<section class="step" id="step1"><div class="eyebrow">TRAIN STEP 01 · COLLECT</div><h2>旧 Actor 生成 Rollout</h2>
+<p>在一轮采样中，Actor 参数暂时固定。每次拿到 State，用 <code>take_action()</code> 根据概率随机抽 Action；环境返回 Reward 和 Next State。</p>
+<pre>probs = self.actor(state)               # 例如 [0.6, 0.4]
+dist = torch.distributions.Categorical(probs)
+action = dist.sample()                  # 比如采到 Action 0
+# environment.step(action) -> reward, next_state, done</pre>
+<p>收集完得到 <code>states, actions, rewards, next_states, dones</code>。<b>不是每个 token/step 都立刻更新 Actor</b>，而是先完成这批 Rollout。</p>
+<div class="status"><b>Weight 状态：</b>Actor θ 不变；Critic φ 不变。输出是一批 Transition 数据。</div></section>
 
-# (3) autograd 只算梯度，不调用 Adam 更新 Actor
-g = flatten(torch.autograd.grad(objective, actor.parameters()))
+<section class="step" id="step2"><div class="eyebrow">TRAIN STEP 02 · ADVANTAGE</div><h2>用 Critic 计算 TD Error，再用 GAE 得到 Advantage</h2>
+<p>训练需要区分“某个 Action 是否比平均表现更好”。Critic 提供 Value 预测；Reward 加上下一状态 Value 构成 TD Target，再减去当前 Value 得到 TD Error。</p>
+<pre>td_target = rewards + gamma * critic(next_states) * (1 - dones)
+td_delta = td_target - critic(states)
+advantage = compute_advantage(gamma, lmbda, td_delta.cpu())</pre>
+<p>例如当前奖励 1、下一状态预测 5、当前状态预测 4、γ=0.9，则 TD Error = 1 + 0.9×5 − 4 = <b>1.5</b>。</p>
+<div class="data"><b>GAE 的 λ 干什么？</b>决定 Advantage 有多大程度依赖更远的实际 TD Error，而不是在近期就使用 Critic 预测。γ 定义长期 Reward 折扣，不能简单用小 γ 替代 λ。</div>
+<div class="row"><label for="lam">调整 λ：<input id="lam" type="range" min="0" max="1" step=".05" value=".95"></label><b id="lamText"></b></div>
+<p>假设 TD Errors 为 [1, 2, 3]、γ=0.9，则第 0 步的 GAE Advantage 为 <b id="gaeText"></b>。</p>
+<div class="status"><b>Weight 状态：</b>两个网络仍未更新。我们只是获得固定的 Advantage 数值，后面 Actor 不会反向传播更新 Critic。</div></section>
 
-# (4) KL Hessian-vector products + Conjugate Gradient
-direction = conjugate_gradient(lambda v: fvp(v), g)
-
-# (5) 根据 KL 约束缩放方向，再通过 Line Search 检查
-candidate_step = scale_to_kl_limit(direction, kl_limit)
-accepted_weights = line_search(
-    actor, states, old_dist, old_logp, advantages, candidate_step
+<section class="step" id="step3"><div class="eyebrow">TRAIN STEP 03 · SNAPSHOT</div><h2>保存 Old Policy 概率</h2>
+<p>Rollout 是旧 Actor 采集的，因此我们必须把旧概率留住。后面 Candidate Actor 变了，分母仍然不变。</p>
+<pre>old_action_dists = Categorical(
+    probs=self.actor(states).detach()
 )
+old_log_probs = old_action_dists.log_prob(
+    actions.squeeze(1)
+).unsqueeze(1)</pre>
+<table><thead><tr><th>变量</th><th>实际存什么</th><th>后面在哪里用</th></tr></thead><tbody><tr><td>old_log_probs</td><td>每个采样 Action 对应的 log probability</td><td>Importance Ratio</td></tr><tr><td>old_action_dists</td><td>每个 State 下所有 Action 的概率</td><td>KL</td></tr></tbody></table>
+<div class="status"><b>Weight 状态：</b>Actor 和 Critic 均未变。<code>detach()</code> 只是阻断旧概率的计算图，不是更新网络。</div></section>
 
-# (6) 唯一真正写回 Actor 的操作
-vector_to_parameters(accepted_weights, actor.parameters())</pre>
-<h2>16 · 四个常见误区</h2>
-<details><summary>误区 1：KL 是筛选 Rollout 是否能用的开关？</summary><p>不是。这里 Rollout 用来计算 Advantage 和 Gradient。KL 用来控制候选 Policy 相对旧 Policy 的变化。一次 Candidate 超标通常先缩小 Step，而不是丢掉 Rollout。</p></details>
-<details><summary>误区 2：Ratio=1，所以 Surrogate Objective 没有梯度？</summary><p>Ratio 当前数值是 1，但 Ratio 仍是当前 Actor Weight 的函数，它的斜率通常非零。不能提前把 Ratio 替换成常量 1 再求导。</p></details>
-<details><summary>误区 3：CG 就是用新的 Learning Rate 训练网络？</summary><p>不是。CG 只解线性方程得到方向；实际网络更新发生在 Line Search 接受参数并写回 Actor 后。Critic 则可以继续用 Adam。</p></details>
-<details><summary>误区 4：KL 小意味着真实 Reward 一定提高？</summary><p>不是。KL 只度量分布变化；Surrogate Objective 也是基于有限采样和估计 Advantage 的近似。Line Search 检查的是 Surrogate Improvement，不是直接证明真实期望回报必然提高。</p></details>
-</section>
-<footer>继续学习：<a href="/PolicyGradient/">六种 Policy Gradient 学习信号</a> · <a href="https://spinningup.openai.com/en/latest/algorithms/trpo.html">OpenAI Spinning Up · TRPO</a></footer>
-</main><script>
-const slider=document.getElementById('pnew');
-function update(){const p=Number(slider.value),q=1-p;
-const kl=.6*Math.log(.6/p)+.4*Math.log(.4/q);
-document.getElementById('pout').textContent=p.toFixed(2);
-document.getElementById('ratio').textContent=(p/.6).toFixed(3);
-document.getElementById('kl').textContent=kl.toFixed(4);
-document.getElementById('accept').textContent=kl<=.03?'是（还需目标改善）':'否（需要缩小步长）';}
-slider.addEventListener('input',update);update();
-const lr=document.getElementById('lambdaRange'),sr=document.getElementById('stepRange');
-function refreshExtra(){const l=Number(lr.value),c=.9*l;
-document.getElementById('lambdaValue').textContent=l.toFixed(2);
-document.getElementById('gaeValue').textContent=(1+2*c+3*c*c).toFixed(4);
-const scale=Math.pow(.5,Number(sr.value));
-document.getElementById('stepLabel').textContent=(scale*100).toFixed(2)+'%';
-document.getElementById('w1').textContent=(.5+.02*scale).toFixed(5);
-document.getElementById('w2').textContent=(.2+.1*scale).toFixed(5);}
-lr.addEventListener('input',refreshExtra);sr.addEventListener('input',refreshExtra);refreshExtra();
+<section class="step" id="step4"><div class="eyebrow">TRAIN STEP 04 · CRITIC UPDATE</div><h2>Critic 先用 Adam 更新一次</h2>
+<p>Critic 预测的 Value 与 TD Target 比较，MSE Loss 通过 Backpropagation 更新 Critic 参数。你给的实现是在完成 Advantage 估计后才执行这一段，因此本批次 Advantage 已经固定。</p>
+<pre>critic_loss = F.mse_loss(critic(states), td_target.detach())
+critic_optimizer.zero_grad()
+critic_loss.backward()
+critic_optimizer.step()       # ← 这行真正修改 Critic φ</pre>
+<div class="status"><b>Weight 状态：</b><b>Critic φ 已更新</b>；Actor θ 还没有更新。后续 TRPO 处理的是 Actor。</div></section>
+
+<section class="step" id="step5"><div class="eyebrow">TRAIN STEP 05 · POLICY GRADIENT</div><h2>计算 Surrogate Objective 和 Actor Gradient</h2>
+<p>现在使用固定的 Rollout Actions、Advantage 和旧概率，重新查询当前 Actor 对这些 Actions 的概率。</p>
+<pre>log_probs = torch.log(actor(states).gather(1, actions))
+ratio = torch.exp(log_probs - old_log_probs)
+surrogate_obj = (ratio * advantage.detach()).mean()
+grads = torch.autograd.grad(surrogate_obj, actor.parameters())
+g = torch.cat([x.reshape(-1) for x in grads]).detach()</pre>
+<p><b>关键疑问：Actor 还没更新，Ratio 不就是 1 吗？</b>是的。初始时新旧概率相等，所以 Ratio 的<b>当前数值</b>是 1。但它仍然是参数 θ 的函数，我们求的是“如果稍微改变 θ，Ratio 会怎么变化”。其导数通常非零。</p>
+<p>Advantage 为正，梯度倾向于增加被采样 Action 的概率；Advantage 为负，则倾向降低。由于网络参数共享，最终各 Action 的概率变化并不是独立的。</p>
+<div class="status"><b>Weight 状态：</b>Actor θ 仍不变。<code>autograd.grad()</code> 只返回 Gradient，不是 <code>optimizer.step()</code>。</div></section>
+
+<section class="step" id="step6"><div class="eyebrow">TRAIN STEP 06 · KL CURVATURE</div><h2>通过 KL 的二阶信息，判断哪些 Weight 更敏感</h2>
+<p>如果两个 Weight 有相同的原始 Gradient，一个 Weight 轻微改变就会让输出概率跳很大，另一个却不会。TRPO 不希望一视同仁。它使用 KL Hessian 描述这种敏感程度。</p>
+<pre>new_action_dists = Categorical(self.actor(states))
+kl = kl_divergence(old_action_dists, new_action_dists).mean()
+kl_grad = torch.autograd.grad(
+    kl, self.actor.parameters(), create_graph=True
+)
+flat = torch.cat([v.reshape(-1) for v in kl_grad])
+scalar = torch.dot(flat, vector)
+Hv = torch.autograd.grad(scalar, self.actor.parameters())</pre>
+<p><b>KL 此时也是 0，为什么还可以用？</b>因为 TRPO 用的是 KL 的<b>二阶导数</b>。例如函数 x² 在 x=0 时数值和一阶导都为 0，但二阶导等于 2。</p>
+<div class="data">不用存下完整 Hessian 矩阵。只需输入一个向量 v，计算 H 与 v 的乘积（Hessian-vector Product），就能供下一步 CG 使用。</div>
+<div class="status"><b>Weight 状态：</b>Actor θ 不变，只计算 KL 对 Weight 变化的局部敏感程度。</div></section>
+
+<section class="step" id="step7"><div class="eyebrow">TRAIN STEP 07 · CG</div><h2>Conjugate Gradient 只负责找方向，不负责更新网络</h2>
+<p>输入：刚才的 Policy Gradient g，以及能够执行 <code>H @ v</code> 的函数。CG 迭代求解 <code>H x = g</code>，最后返回一个经过 KL 曲率调整的方向 x。</p>
+<div class="grid"><div class="mini"><b>普通 Gradient</b><br>g = [1, 1]</div><div class="mini"><b>假设 KL 曲率对角为 [100, 1]</b><br>CG 得到 x = [0.01, 1]</div></div>
+<p>第一个参数对 Policy 变化非常敏感，因此即使原始 Gradient 相同，TRPO 给它更小的相对更新分量。</p>
+<pre># 简化的调用逻辑
+direction = conjugate_gradient(
+    policy_gradient=g,
+    matrix_vector_product=hessian_matrix_vector_product
+)
+# direction ≈ H^{-1} g
+# 此时没有 Actor Weight Update</pre>
+<p class="small">实际 CG 通过迭代 Residual、Search Direction 和 HVP 求解；实践中常对 Hessian 加 Damping，以防不稳定。</p>
+<div class="status"><b>Weight 状态：</b>Actor θ 不变；我们现在只得到“沿哪个方向尝试更新”。</div></section>
+
+<section class="step" id="step8"><div class="eyebrow">TRAIN STEP 08 · CANDIDATE STEP</div><h2>根据 KL Threshold，算出最多尝试多大的参数步长</h2>
+<p>有方向还不够。TRPO 用 KL 的局部二阶近似计算可接受的候选步长尺度。这里的 <code>kl_constraint</code> 控制的是 Policy Distribution 的变化，不是普通 Adam Learning Rate。</p>
+<pre>Hd = hessian_matrix_vector_product(states, old_dist, direction)
+max_coef = torch.sqrt(
+    2 * kl_constraint / (torch.dot(direction, Hd) + 1e-8)
+)
+candidate_step = direction * max_coef</pre>
+<p>例如方向为 [0.01, 1]，若缩放系数是 0.1，候选更新就是 [0.001, 0.1]。<b>这是候选值，不是已经接受的更新。</b></p>
+<div class="status"><b>Weight 状态：</b>Actor θ 仍不变。候选步长已经算好，下一步才会试。</div></section>
+
+<section class="step" id="step9"><div class="eyebrow">TRAIN STEP 09 · BACKTRACKING</div><h2>在 Actor 副本上试候选权重，过大就缩小</h2>
+<pre>old_weights = parameters_to_vector(actor.parameters())
+for i in range(15):
+    coef = alpha ** i        # 例如 1, .5, .25, .125 ...
+    trial_weights = old_weights + coef * candidate_step
+    trial_actor = copy.deepcopy(actor)
+    vector_to_parameters(trial_weights, trial_actor.parameters())
+    # 检查 KL(old, trial) 和 Objective(trial)
+    if kl_ok and objective_improves:
+        return trial_weights
+return old_weights           # 所有尝试都失败则不更新</pre>
+<p>所以，<code>alpha</code> 是 Line Search 的<b>缩步系数</b>，并非 Actor 的 Adam Learning Rate。KL 超标通常是缩小参数更新，不是丢弃本批 Rollout。</p>
+<div class="row"><label>试验 Step 比例：<input id="stepSlider" type="range" min="0" max="4" step="1" value="0"></label><b id="stepPct"></b></div>
+<div class="grid"><div class="mini">旧 Weight：[0.50, 0.20]<br>原始 Candidate Step：[0.02, 0.10]</div><div class="mini">当前尝试的 Weight：<strong id="trialWeights"></strong><br>接下来检查 KL 和 Objective。</div></div>
+<p><b>注意：</b>必须同时满足 <code>KL &lt; threshold</code> 和 <code>new objective &gt; old objective</code>。没有通过，就继续缩小，直到接受或放弃。</p>
+<div class="status"><b>Weight 状态：</b>真正的 Actor θ 仍不变；只是临时的 Actor 副本在尝试。</div></section>
+
+<section class="step" id="step10"><div class="eyebrow">TRAIN STEP 10 · COMMIT UPDATE</div><h2>终于真正更新 Actor Weight</h2>
+<pre>new_para = line_search(...)
+torch.nn.utils.convert_parameters.vector_to_parameters(
+    new_para, self.actor.parameters()
+)    # ← 唯一将已接受参数写回实际 Actor 的地方</pre>
+<p>若 Line Search 接受 Candidate，这行写入新的 Actor Weight；若所有尝试失败，<code>new_para</code> 等于旧参数，这行实际上不会改变 Actor。</p>
+<p>然后下一轮训练：<b>用更新后的 Actor 重新收集数据</b>，重新计算 Advantage 和 Policy Gradient。旧概率快照也需要重新建立。</p>
+<div class="status"><b>Weight 状态：</b>Critic 在 Step 04 已更新；Actor 在本步才有可能更新。至此完整一次 TRPO Train Step 结束。</div></section>
+
+<h2>一张表复盘：每一步到底有没有改 Weight？</h2><table><thead><tr><th>时间</th><th>训练操作</th><th>Actor Weight</th><th>Critic Weight</th></tr></thead><tbody>
+<tr><td>01–03</td><td>Rollout → GAE → 固定 Old Probs</td><td>不变</td><td>不变</td></tr>
+<tr><td>04</td><td>Critic Adam Step</td><td>不变</td><td>更新</td></tr>
+<tr><td>05–08</td><td>Gradient → KL HVP → CG → Candidate</td><td>不变</td><td>不变</td></tr>
+<tr><td>09</td><td>Line Search 检查 Actor 副本</td><td>不变</td><td>不变</td></tr>
+<tr><td>10</td><td>Accept &amp; Write Weights</td><td>可能更新</td><td>不变</td></tr></tbody></table>
+<details><summary>为什么 TRPO 不直接用 Adam + 小 Learning Rate？</summary><p>因为 Learning Rate 控制参数更新大小，而 Policy 的输出分布可能对不同参数有不同敏感度。TRPO 的 KL Hessian 调整方向，KL Threshold 缩放步长，Line Search 检查实际 KL 与 Surrogate Improvement。Adam 本身没有这个约束。</p></details>
+<details><summary>与 PPO-Clip 对比</summary><p>PPO-Clip 通常利用 clipped probability-ratio objective，并使用 Adam 更新 Actor；可以附加 KL early stopping。TRPO 显式优化带平均 KL 约束的 surrogate，使用二阶局部近似、CG 和 Line Search。PPO 的 clip 并不等于严格 KL 限制。</p></details>
+<details><summary>这段教学代码的实际边界</summary><p>GAE 应在真正的 Episode 结束处重置；超时截断与终止要分清。CG 通常需要 Hessian Damping 和数值保护。训练时应保存 Old Policy Snapshot，并确保采样期间参数固定。有限样本的 Surrogate 改善不等于保证真实 Return 一定提高。</p></details>
+<footer><a href="/PolicyGradient/">返回 Policy Gradient</a> · <a href="https://spinningup.openai.com/en/latest/algorithms/trpo.html">Spinning Up · TRPO</a></footer></main>
+<script>
+const lam=document.getElementById('lam'),step=document.getElementById('stepSlider');
+function refresh(){
+const l=Number(lam.value),c=.9*l;
+document.getElementById('lamText').textContent=l.toFixed(2);
+document.getElementById('gaeText').textContent=(1+2*c+3*c*c).toFixed(4);
+const frac=Math.pow(.5,Number(step.value));
+document.getElementById('stepPct').textContent=(100*frac).toFixed(2)+'%';
+document.getElementById('trialWeights').textContent='['+(.5+.02*frac).toFixed(5)+', '+(.2+.1*frac).toFixed(5)+']';
+}lam.addEventListener('input',refresh);step.addEventListener('input',refresh);refresh();
 </script></body></html>
