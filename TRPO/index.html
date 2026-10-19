@@ -61,6 +61,121 @@ accept if (
 <details><summary>展开：GAE 的 gamma 与 lambda 各做什么？</summary><p><b>Gamma</b> 定义未来 Reward 的折扣，因此也定义优化目标。<b>Lambda</b> 只改变 Advantage 估计中真实后续奖励与 Critic 预测的折中。减小 gamma 会改变任务偏好；减小 lambda 不等价于改变 gamma。</p></details>
 <details><summary>展开：为什么说 TRPO 比 PPO 更“严格”？</summary><p>TRPO 显式检查候选更新的平均 KL，并使用受约束的二阶近似来选步长。PPO-Clip 通常用 Adam 优化 clipped surrogate，并可选择监控 KL 或提前停止。PPO 的 clipping 本身并不严格保证 KL 阈值不被超过。TRPO 对平均 KL 的检查也不等于每个 State 都得到严格的理论保证。</p></details>
 <h2>07 · 建议学习顺序</h2><p>先理解 <strong>Ratio 在旧参数处为 1 但梯度不为零</strong>，再理解 <strong>KL Hessian 改变方向</strong>，最后理解 <strong>Line Search 只在满足 KL 且 Objective 改善时接受参数</strong>。理解这三个点，TRPO 的执行顺序就清楚了。</p>
+
+<section id="walkthrough">
+<h2>08 · 手算一次 TRPO：从 3 个 Action 到 Weight</h2>
+<p>先固定一个 State，旧 Policy 对三个动作的概率为 [0.5, 0.3, 0.2]。Rollout 已经采好，并通过 Critic 计算出 Advantage。这个小例子是帮助理解，不代表真实网络只有一个 State。</p>
+<div class="card"><table><thead><tr><th>采样 Action</th><th>旧概率</th><th>Advantage</th><th>更新希望发生什么</th></tr></thead><tbody><tr><td>A</td><td>0.50</td><td>+2</td><td>提高概率</td></tr><tr><td>B</td><td>0.30</td><td>−1</td><td>降低概率</td></tr><tr><td>C</td><td>0.20</td><td>−3</td><td>降低概率</td></tr></tbody></table>
+<p>只要记住：<b>Advantage 决定动作的好坏；梯度告诉我们应如何修改网络 Weight。</b> 不能直接逐项修改表格中的 Action Probability，因为它们都是共享网络参数经 Softmax 产生的。</p></div>
+<h2>09 · 先算 Ratio，再算 Gradient：时间顺序一点也不矛盾</h2>
+<div class="card">
+<p><b>时刻 A（刚采完 Rollout）</b>：<code>old_log_probs</code> 来自旧策略，保存下来并 <code>detach</code>。此时当前 Actor 参数也等于旧参数，所以 Ratio 对每个采样 Action 都是 1。</p>
+<p><b>时刻 B（求 Gradient）</b>：我们对“若 Weight 稍微变化，Ratio 会怎样变化”求导。<b>当前 Ratio=1，不意味着 Ratio 的斜率=0。</b></p>
+<pre># old_log_probs 不随优化参数改变
+current_logp = actor(states).log_prob(actions)
+ratio = (current_logp - old_log_probs).exp()  # 初始值约为 1
+objective = (ratio * advantages).mean()
+g = torch.autograd.grad(objective, actor.parameters())
+# 这里只求梯度，没有执行 optimizer.step()，Weight 不变</pre>
+<p><b>时刻 C（尝试 Candidate）</b>：把暂时算出的新 Weight 放进 Actor 副本。再次计算 Ratio，它才可能从 1 变成 1.2 或 0.8。此时用于检查“改完是否更好”，而不是重新生成 Rollout。</p>
+</div>
+<h2>10 · Critic 和 GAE：为什么先有 Advantage 才能优化 Actor？</h2>
+<p>Critic 预测从 State 出发的未来 Return；它不负责选择 Action。Rollout 的每一步都有 Reward，而 Critic 会对当前 State 和下一 State 给出预测。</p>
+<div class="card">
+<pre># 一个非终止 Transition
+reward = 1.0
+gamma = 0.9
+value_now = 4.0
+value_next = 5.0
+td_error = reward + gamma * value_next - value_now  # 1.5</pre>
+<p>1-step TD Error 可以直接当作 Advantage 的估计，但会依赖 Critic 的准确性。GAE 从后往前累加 TD Error：越远的 TD Error，权重通常越低。</p>
+<div class="row"><label>GAE λ <input id="lambdaRange" type="range" min="0" max="1" step=".05" value=".95"></label><strong id="lambdaValue">0.95</strong></div>
+<p>假设三个连续 TD Error 为 [1, 2, 3]，γ=0.9：初始时间步的 GAE Advantage = <strong id="gaeValue"></strong>。</p>
+<p class="muted">λ=0 只依赖当前 TD Error；λ=1 在完整终止 Episode 下相当于 Monte Carlo Return 减去当前 Value。γ 定义长期奖励的折扣，λ 决定 Advantage 估计有多依赖较远的实际观测。</p>
+</div>
+<h2>11 · 为什么要用 KL Hessian，而不是只用 Learning Rate？</h2>
+<p>假设两个 Weight 的 Policy Gradient 都是 1。普通 SGD 倾向于同时增加它们。但其中一个 Weight 的轻微变化可能让输出概率剧烈变化，另一个 Weight 则不敏感。</p>
+<div class="card">
+<p>为方便手算，设 Gradient 为 <b>[1, 1]</b>，KL Hessian 是一个对角矩阵，对角线为 <b>[100, 1]</b>。</p>
+<table><thead><tr><th>参数</th><th>原始 Gradient</th><th>KL 敏感程度</th><th>调整后的方向</th></tr></thead><tbody><tr><td>w₁</td><td>1</td><td>100（敏感）</td><td>0.01</td></tr><tr><td>w₂</td><td>1</td><td>1（不敏感）</td><td>1</td></tr></tbody></table>
+<p>这就是为什么 TRPO 的方向可能不同于普通梯度：<b>它试图用有限的 Policy Distribution Change 换取更多的 Objective Improvement。</b> 实际 Hessian 还含有非对角项，因此参数之间可能互相影响。</p>
+</div>
+<h2>12 · Hessian-vector Product 到底计算了什么？</h2>
+<p>如果 Actor 有百万参数，完整 Hessian 就有万亿个元素，没有必要把它保存下来。TRPO 只需要一个服务：给它向量 <code>v</code>，返回 <code>H @ v</code>。</p>
+<pre>def hvp(actor, states, old_dist, vector):
+    new_dist = actor(states)
+    kl = kl_divergence(old_dist, new_dist).mean()
+    first = torch.autograd.grad(
+        kl, actor.parameters(), create_graph=True
+    )
+    flat_first = torch.cat([x.reshape(-1) for x in first])
+    directional_derivative = (flat_first * vector).sum()
+    second = torch.autograd.grad(
+        directional_derivative, actor.parameters()
+    )
+    return torch.cat([x.reshape(-1) for x in second])</pre>
+<p>第一次求导得到 KL 的 Gradient；与给定向量做点积；再求一次导就得到 <code>H @ v</code>。这并没有修改 Actor 参数。示例假设 <code>actor(states)</code> 返回分布对象。</p>
+<h2>13 · Conjugate Gradient（CG）在做什么？</h2>
+<p>我们已经有 Policy Gradient <code>g</code>，希望得到经过 KL 调整的方向 <code>x</code>，满足 <code>H x = g</code>。CG 不是更新神经网络的 Optimizer；它只是在<b>求一个线性方程的近似解</b>。</p>
+<div class="card">
+<p><b>初始</b>：x=0，Residual r=g，意思是还没有满足 Hx=g。</p>
+<p><b>每轮</b>：调用 HVP 得到 Hp；根据 Residual 选择搜索步长；改进 x；重新计算 Residual。</p>
+<p><b>结束</b>：Residual 足够小，或达到迭代上限，返回方向 x。真实实现通常对 HVP 加 Damping，并处理数值异常。</p>
+<pre>x = zeros_like(g)
+r = g.clone()
+p = r.clone()
+for iteration in range(10):
+    Hp = hvp(p)               # 不构造完整 H
+    step = dot(r, r) / dot(p, Hp)
+    x = x + step * p
+    r_new = r - step * Hp
+    if dot(r_new, r_new) < tolerance:
+        break
+    p = r_new + (dot(r_new, r_new) / dot(r, r)) * p
+    r = r_new
+# x 是方向，不是已经更新好的网络</pre>
+</div>
+<h2>14 · Candidate Step 与 Line Search：什么时候真正改 Weight？</h2>
+<p>有了 CG 返回的方向，还不能直接改 Weight。首先按 KL Threshold 缩放这个方向，形成<b>候选步长</b>，再用 Line Search 在 Actor 副本上试验。</p>
+<div class="card">
+<p>假设当前 Weight 是 <code>[0.50, 0.20]</code>，Candidate Step 是 <code>[0.02, 0.10]</code>，Line Search 缩减系数为 0.5。</p>
+<div class="row"><label>尝试保留候选 Step 的比例 <input id="stepRange" type="range" min="0" max="4" step="1" value="0"></label><b id="stepLabel">100%</b></div>
+<div class="result"><div><small>候选 w₁</small><br><b id="w1"></b></div><div><small>候选 w₂</small><br><b id="w2"></b></div><div><small>接下来做什么？</small><br>评估 KL 和 Objective</div></div>
+<p>如果平均 KL 超标，或者 Surrogate Objective 没有改善，就缩小 Step 再试。<b>只有 Accept Update 后</b>才把最终参数写入真正的 Actor；全部候选都失败则保留原 Weight。</p>
+</div>
+<h2>15 · 对应 PyTorch：从 update 到最终写回参数</h2>
+<p>下列代码仅保留顺序和关键变量；<code>gaes</code>、<code>fvp</code>、<code>conjugate_gradient</code> 和 <code>line_search</code> 的完整实现沿用上面各节。它是带注释的流程骨架，不是独立可运行的训练脚本。</p>
+<pre># (1) rollout 已经由 old actor 收集
+with torch.no_grad():
+    old_dist = Categorical(probs=actor(states))
+    old_logp = old_dist.log_prob(actions)
+    advantages = gaes(rewards, values, dones, gamma, lam)
+
+# (2) 当前 actor == rollout 时的 actor；ratio 约为 1
+new_logp = Categorical(probs=actor(states)).log_prob(actions)
+ratio = (new_logp - old_logp).exp()
+objective = (ratio * advantages).mean()
+
+# (3) autograd 只算梯度，不调用 Adam 更新 Actor
+g = flatten(torch.autograd.grad(objective, actor.parameters()))
+
+# (4) KL Hessian-vector products + Conjugate Gradient
+direction = conjugate_gradient(lambda v: fvp(v), g)
+
+# (5) 根据 KL 约束缩放方向，再通过 Line Search 检查
+candidate_step = scale_to_kl_limit(direction, kl_limit)
+accepted_weights = line_search(
+    actor, states, old_dist, old_logp, advantages, candidate_step
+)
+
+# (6) 唯一真正写回 Actor 的操作
+vector_to_parameters(accepted_weights, actor.parameters())</pre>
+<h2>16 · 四个常见误区</h2>
+<details><summary>误区 1：KL 是筛选 Rollout 是否能用的开关？</summary><p>不是。这里 Rollout 用来计算 Advantage 和 Gradient。KL 用来控制候选 Policy 相对旧 Policy 的变化。一次 Candidate 超标通常先缩小 Step，而不是丢掉 Rollout。</p></details>
+<details><summary>误区 2：Ratio=1，所以 Surrogate Objective 没有梯度？</summary><p>Ratio 当前数值是 1，但 Ratio 仍是当前 Actor Weight 的函数，它的斜率通常非零。不能提前把 Ratio 替换成常量 1 再求导。</p></details>
+<details><summary>误区 3：CG 就是用新的 Learning Rate 训练网络？</summary><p>不是。CG 只解线性方程得到方向；实际网络更新发生在 Line Search 接受参数并写回 Actor 后。Critic 则可以继续用 Adam。</p></details>
+<details><summary>误区 4：KL 小意味着真实 Reward 一定提高？</summary><p>不是。KL 只度量分布变化；Surrogate Objective 也是基于有限采样和估计 Advantage 的近似。Line Search 检查的是 Surrogate Improvement，不是直接证明真实期望回报必然提高。</p></details>
+</section>
 <footer>继续学习：<a href="/PolicyGradient/">六种 Policy Gradient 学习信号</a> · <a href="https://spinningup.openai.com/en/latest/algorithms/trpo.html">OpenAI Spinning Up · TRPO</a></footer>
 </main><script>
 const slider=document.getElementById('pnew');
@@ -71,4 +186,13 @@ document.getElementById('ratio').textContent=(p/.6).toFixed(3);
 document.getElementById('kl').textContent=kl.toFixed(4);
 document.getElementById('accept').textContent=kl<=.03?'是（还需目标改善）':'否（需要缩小步长）';}
 slider.addEventListener('input',update);update();
+const lr=document.getElementById('lambdaRange'),sr=document.getElementById('stepRange');
+function refreshExtra(){const l=Number(lr.value),c=.9*l;
+document.getElementById('lambdaValue').textContent=l.toFixed(2);
+document.getElementById('gaeValue').textContent=(1+2*c+3*c*c).toFixed(4);
+const scale=Math.pow(.5,Number(sr.value));
+document.getElementById('stepLabel').textContent=(scale*100).toFixed(2)+'%';
+document.getElementById('w1').textContent=(.5+.02*scale).toFixed(5);
+document.getElementById('w2').textContent=(.2+.1*scale).toFixed(5);}
+lr.addEventListener('input',refreshExtra);sr.addEventListener('input',refreshExtra);refreshExtra();
 </script></body></html>
