@@ -1,0 +1,65 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GRPO · LLMExp</title><style>:root{--bg:#f4f3ed;--ink:#18352e;--muted:#61736a;--accent:#177b5a;--line:#d4ddd3}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}header{border-bottom:1px solid var(--line);padding:16px 5%;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}a{color:var(--accent)}nav a{margin-left:14px}main{max-width:1100px;margin:auto;padding:42px 22px 80px}h1{font-size:clamp(36px,5vw,60px);line-height:1.2}h2{font-size:27px}h3{margin-bottom:5px}.lead{color:var(--muted);font-size:19px}.eyebrow{color:var(--accent);font:700 12px system-ui;letter-spacing:2px}.step{background:#fffefa;border:1px solid var(--line);border-radius:18px;padding:26px;margin:22px 0;scroll-margin-top:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.mini{padding:17px;background:#eaf1e9;border-radius:12px}.flow{padding:16px;background:#eaf1e9;text-align:center;border-radius:12px;font-weight:700}.arrow{text-align:center;color:#177b5a;font-size:23px}.muted{color:var(--muted)}.note{border-left:4px solid #177b5a;background:#eaf1e9;padding:13px 17px;border-radius:5px}.warn{border-left:4px solid #b77a38;background:#f3ede0;padding:13px 17px}pre{background:#132b24;color:#d6eadd;padding:20px;border-radius:11px;overflow:auto;font:13px/1.6 ui-monospace,monospace}code{background:#e9efea;padding:2px 5px;border-radius:4px}pre code{background:transparent;padding:0}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:11px;text-align:left;border-bottom:1px solid var(--line)}.toc a{display:inline-block;margin:3px 15px 3px 0}.small{font-size:13px;color:var(--muted)}input[type=range]{accent-color:var(--accent);width:min(330px,100%)}output{font-weight:700}footer{border-top:1px solid var(--line);padding-top:24px;margin-top:50px}@media(max-width:700px){.grid{grid-template-columns:1fr}.step{padding:18px}main{padding:24px 15px}}</style></head><body><header><b>RL / GRPO</b><nav><a href="/">首页</a><a href="/TRPO/">TRPO</a><a href="/PPO/">PPO</a><a href="/GRPO/">GRPO</a></nav></header><main><div class="eyebrow">GROUP RELATIVE · TOKEN-LEVEL UPDATE</div><h1>GRPO：从架构到每一个 Train Step</h1><p class="lead">从同一 Prompt 的多条 Responses 入手，看整段 Reward 如何广播到 Tokens，并逐行拆解 IS / Clipping / Reference KL。</p>
+<div class="note"><b>一句话：</b>GRPO 用同 Prompt 的多个 Responses 比较 Reward 形成 Group Advantage，去掉 Critic；但每个生成 Token 仍然有独立的 Ratio、Clipping 项和梯度。</div>
+<p class="toc"><a href="#arch">架构</a><a href="#sample">01 Group Rollout</a><a href="#reward">02 Advantage</a><a href="#broadcast">03 Token 广播</a><a href="#old">04 Old / Ref</a><a href="#ratio">05 IS & Clip</a><a href="#kl">06 KL</a><a href="#loss">07 Loss</a><a href="#update">08 Adam</a><a href="#compare">PPO 比较</a></p>
+<section class="step" id="arch"><div class="eyebrow">ARCHITECTURE</div><h2>一个 Trainable Actor + 一个可选 Frozen Reference；没有 Critic</h2>
+<div class="flow">Prompts → Old Actor → 每个 Prompt G 个 Responses</div><div class="arrow">↓</div><div class="grid"><div class="mini"><b>Reward Function</b><p>每个完整 Response 得到 R<sub>i</sub> → 组内均值/标准差 → A<sub>i</sub>。</p></div><div class="mini"><b>Old / Reference</b><p>Old 对应本轮采样、用于 IS；Reference 长期冻结、用于可选 KL 正则化。</p></div></div><div class="arrow">↓</div><div class="flow">Token-wise Ratio + Broadcast Advantage + Clip + β KL → Actor Adam</div>
+<p>本教程展示经典 GRPO-Clip + 可选 Reference KL。Reference KL 不是 GRPO 必需项：β=0 时可以不创建 Reference 模型。</p></section>
+<section class="step" id="sample"><div class="eyebrow">01 / GROUP ROLLOUT</div><h2>同一 Prompt 采样多个完整答案</h2>
+<pre># [B] prompts → [B*G, L] completion tokens
+prompts_repeated = repeat_each_prompt(prompts, group_size=4)
+with torch.no_grad():
+    completions = actor.generate(prompts_repeated)
+    old_log_probs = actor.log_probs(prompts_repeated, completions)
+</pre><p>例如 Prompt “法国首都？”得到 4 条 Responses：Paris、London、Paris in France、Berlin。生成时必须保存对应 Token 的 Old Log Probability。</p></section>
+<section class="step" id="reward"><div class="eyebrow">02 / GROUP ADVANTAGE</div><h2>整段 Response 打分 → Group Relative Advantage</h2>
+<pre># 假设同一组 Rewards = [1, 0, 1, 0]
+rewards = torch.tensor([1., 0., 1., 0.])
+mean = rewards.mean()                          # 0.5
+std = rewards.std(unbiased=False)              # 0.5
+advantages = (rewards - mean) / (std + 1e-8)
+# [ +1, -1, +1, -1 ]，shape [B*G]</pre>
+<p>Reward 通常来自完整 Response 的结果正确性、规则检查或 Reward Model。GRPO 不在每个 Token 上训练 V(s)，因此不需要 Critic/GAE。</p>
+<div class="warn">如果一组 Rewards 全相同，组内标准化 Advantage 会变为 0（通常加 epsilon 防止除零）；这一组对 Clipped Policy Objective 不提供有效梯度。</div></section>
+<section class="step" id="broadcast"><div class="eyebrow">03 / CREDIT ASSIGNMENT</div><h2>Whole-Response Advantage 怎么变 Per-Token？</h2><div class="grid"><div class="mini"><b>Response 1：Paris is correct</b><p>Reward 1 → Advantage +1 → 三个 Tokens 的 Advantage 均为 +1。</p></div><div class="mini"><b>Response 2：London is wrong</b><p>Reward 0 → Advantage −1 → 三个 Tokens 的 Advantage 均为 −1。</p></div></div>
+<pre># advantages [B*G]
+token_adv = advantages[:, None]  # [B*G,1]
+# 和 ratio [B*G,L] 相乘时广播
+</pre><p><b>这不是识别“哪个 Token 真正导致 Reward”。</b>它只是把同一整段回答的质量信号分配到每个生成位置。每个 Token 的 logπ 梯度仍然不同。</p></section>
+<section class="step" id="old"><div class="eyebrow">04 / THREE POLICIES</div><h2>Old、Current、Reference 的不同时间尺度</h2>
+<table><tr><th>Policy</th><th>何时改变</th><th>用途</th></tr><tr><td>Old</td><td>每批重新 Rollout 后刷新</td><td>IS Ratio 分母</td></tr><tr><td>Current</td><td>每个 Adam Step 更新</td><td>Actor Gradient</td></tr><tr><td>Reference</td><td>通常整个 RL 训练冻结</td><td>长期 KL Anchor</td></tr></table><pre>with torch.no_grad():
+    old_log_probs = rollout_log_probs
+    ref_log_probs = reference.log_probs(prompts, completions)
+# reference.eval(); requires_grad_(False)
+</pre></section>
+<section class="step" id="ratio"><div class="eyebrow">05 / TOKEN IMPORTANCE WEIGHTS</div><h2>每个 Token 自己的 Ratio 和 Clip</h2><pre>current_log_probs = actor.log_probs(prompts, completions) # [B*G,L]
+ratio = torch.exp(current_log_probs - old_log_probs)
+adv = advantages[:, None]                               # [B*G,1]
+surr1 = ratio * adv
+surr2 = ratio.clamp(1-eps,1+eps) * adv
+clipped_objective = torch.minimum(surr1, surr2)          # [B*G,L]</pre><p>假设某个正 Advantage Response 的 Tokens 的 Ratio 是 [1.5,1.1,0.9]；ε=.2；Clip 后每个 Token Objective 分别为 [1.2,1.1,0.9]。第一个 Token 超过上界，不再奖励继续增加概率。</p></section>
+<section class="step" id="kl"><div class="eyebrow">06 / REFERENCE KL</div><h2>为什么 IS 已经有 Ratio，仍然可加 Reference KL？</h2><p>IS 比较 Current / Old（本轮）；Reference KL 比较 Current 与固定的初始 SFT 基准（长期）。两个比值来自不同的分母。</p><pre>d = ref_log_probs - current_log_probs
+kl_token = torch.exp(d) - d - 1
+# d = log(P_ref / P_current)
+# KL estimator per sampled completion token
+# 对从 Current 分布采样时，其期望对应 KL(Current || Ref)
+</pre>
+<div class="mini"><label>Current P(token) <input id="cp" type="range" min=".05" max=".95" value=".6" step=".05"> <output id="pv"></output></label><p>固定 Reference P(token)=0.30；样本级 KL = <b id="kval"></b>。不是整个 Vocabulary 的精确 KL。</p></div>
+<p>在旧策略 Rollout 上复用样本时，严格的无偏估计条件不再自动成立；这里作为训练中的样本级正则项。β=0 可以完全关闭。</p></section>
+<section class="step" id="loss"><div class="eyebrow">07 / AGGREGATION</div><h2>先算 Per-Token Loss，再聚合 Response</h2><pre># completion_mask [B*G,L]：有效 Token 为 1
+per_token_loss = -clipped_objective + beta * kl_token
+response_loss = (
+    (per_token_loss * completion_mask).sum(dim=1)
+    / completion_mask.sum(dim=1).clamp(min=1)
+)                                   # [B*G]
+loss = response_loss.mean()         # scalar</pre><p>不同 GRPO 实现有不同的 Loss Normalization（按 Response 长度 / 固定最大长度 / 全局 Token 数），可能影响长短回答的梯度权重。上面明确使用 <b>每条 Response 内先平均、再跨 Responses 平均</b> 的示意。</p></section>
+<section class="step" id="update"><div class="eyebrow">08 / OPTIMIZER</div><h2>只有 Actor Backprop，没有 Critic Step</h2><pre>for epoch in range(num_epochs):
+    current_log_probs = actor.log_probs(prompts, completions)
+    # 重新算 Ratio、Clip、KL、Masked Loss
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+    optimizer.step()
+# 下轮更新后重新生成 Responses，刷新 Old Log Probs</pre><div class="warn">以上是分步教学伪代码：每个 Epoch 必须重新计算 loss 和计算图；不能拿旧 loss 重复 backward。Grad norm clipping 与 ratio clipping 是两种不同操作。</div></section>
+<section class="step" id="compare"><div class="eyebrow">SIDE BY SIDE</div><h2>与 PPO 的结构和细节逐项对应</h2>
+<table><tr><th>阶段</th><th>PPO</th><th>GRPO</th></tr><tr><td>Rollout</td><td>Trajectory of (s,a,r)</td><td>Same prompt 的 G Responses</td></tr><tr><td>Reward 粒度</td><td>每步或终局</td><td>通常整段</td></tr><tr><td>Advantage</td><td>Critic → TD Errors → GAE（每个 Step/Token 可不同）</td><td>Group Mean/Std（同 Response Tokens 共享）</td></tr><tr><td>IS</td><td>Current / Old</td><td>Current / Old</td></tr><tr><td>Clip</td><td>逐 Step/Token</td><td>逐 Token</td></tr><tr><td>KL</td><td>可选 Old KL Early Stop</td><td>可选 Reference KL Penalty</td></tr><tr><td>Critic</td><td>单独更新 Value</td><td>没有</td></tr></table>
+<p><a href="/PPO/">回看 PPO 的 GAE 和 Critic Backprop →</a></p></section><footer><a href="/">返回首页</a> · <a href="/PolicyGradient/">Policy Gradient</a> · <a href="/TRPO/">TRPO</a> · <a href="/PPO/">PPO</a> · <a href="/GRPO/">GRPO</a></footer></main><script>const s=document.getElementById('cp');function k(){const p=+s.value,q=.3,d=Math.log(q/p);document.getElementById('pv').textContent=p.toFixed(2);document.getElementById('kval').textContent=(Math.exp(d)-d-1).toFixed(4)}s.oninput=k;k();</script></body></html>
