@@ -1,0 +1,61 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PPO · LLMExp</title><style>:root{--bg:#f4f3ed;--ink:#18352e;--muted:#61736a;--accent:#177b5a;--line:#d4ddd3}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}header{border-bottom:1px solid var(--line);padding:16px 5%;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}a{color:var(--accent)}nav a{margin-left:14px}main{max-width:1100px;margin:auto;padding:42px 22px 80px}h1{font-size:clamp(36px,5vw,60px);line-height:1.2}h2{font-size:27px}h3{margin-bottom:5px}.lead{color:var(--muted);font-size:19px}.eyebrow{color:var(--accent);font:700 12px system-ui;letter-spacing:2px}.step{background:#fffefa;border:1px solid var(--line);border-radius:18px;padding:26px;margin:22px 0;scroll-margin-top:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.mini{padding:17px;background:#eaf1e9;border-radius:12px}.flow{padding:16px;background:#eaf1e9;text-align:center;border-radius:12px;font-weight:700}.arrow{text-align:center;color:#177b5a;font-size:23px}.muted{color:var(--muted)}.note{border-left:4px solid #177b5a;background:#eaf1e9;padding:13px 17px;border-radius:5px}.warn{border-left:4px solid #b77a38;background:#f3ede0;padding:13px 17px}pre{background:#132b24;color:#d6eadd;padding:20px;border-radius:11px;overflow:auto;font:13px/1.6 ui-monospace,monospace}code{background:#e9efea;padding:2px 5px;border-radius:4px}pre code{background:transparent;padding:0}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:11px;text-align:left;border-bottom:1px solid var(--line)}.toc a{display:inline-block;margin:3px 15px 3px 0}.small{font-size:13px;color:var(--muted)}input[type=range]{accent-color:var(--accent);width:min(330px,100%)}output{font-weight:700}footer{border-top:1px solid var(--line);padding-top:24px;margin-top:50px}@media(max-width:700px){.grid{grid-template-columns:1fr}.step{padding:18px}main{padding:24px 15px}}</style></head><body><header><b>RL / PPO</b><nav><a href="/">首页</a><a href="/TRPO/">TRPO</a><a href="/PPO/">PPO</a><a href="/GRPO/">GRPO</a></nav></header><main><div class="eyebrow">ACTOR-CRITIC · TRAIN STEP BY TRAIN STEP</div><h1>PPO：从架构到每一个 Train Step</h1><p class="lead">用 Rollout、Critic/GAE、Old Log Prob、IS Ratio、Clipping、KL Monitoring、Adam 串起真正的一次更新。</p>
+<div class="note"><b>一句话：</b>PPO-Clip 保留 TRPO 的 Advantage 与 IS，但用分段的 Clipped Objective + 一阶 Adam，替代 CG、KL 约束与 Line Search。Clip 不是硬约束。</div>
+<p class="toc"><a href="#arch">架构</a><a href="#rollout">01 Rollout</a><a href="#gae">02 GAE</a><a href="#old">03 Old</a><a href="#is">04 IS</a><a href="#clip">05 Clip</a><a href="#critic">06 Critic</a><a href="#update">07 Backprop</a><a href="#kl">08 KL</a><a href="#compare">PPO vs GRPO</a></p>
+<section class="step" id="arch"><div class="eyebrow">ARCHITECTURE</div><h2>Actor 与 Critic 两个可训练网络</h2>
+<div class="flow">Environment → Old Actor Rollout → (state, action, reward, old_log_prob)</div><div class="arrow">↓</div>
+<div class="grid"><div class="mini"><b>Critic φ</b><p>V(s) → TD Error → GAE A<sub>t</sub> → 固定的训练权重 + Return Target。</p></div><div class="mini"><b>Actor θ</b><p>对旧 actions 重新算 log probability → IS → Clip → Actor Loss。</p></div></div><div class="arrow">↓</div><div class="flow">Actor Adam + Critic Adam → Next Rollout</div>
+<p>数据形状：states [T,state_dim]；actions [T]；old_log_probs [T]；advantages [T]。对 LLM PPO，T 可以视为 batch × token 的有效位置数。</p></section>
+<section class="step" id="rollout"><div class="eyebrow">01 / COLLECT</div><h2>先采样，不要边采样边改变 Actor</h2><pre>with torch.no_grad():
+    probs = actor(state)                     # [action_dim]
+    dist = torch.distributions.Categorical(probs)
+    action = dist.sample()
+    old_log_prob = dist.log_prob(action)
+# state, action, reward, next_state, terminated, truncated
+</pre><p>这里 actor 是 Rollout 时刻的策略。在本轮全部 PPO optimizer steps 中，old_log_probs 必须固定。</p></section>
+<section class="step" id="gae"><div class="eyebrow">02 / ADVANTAGE</div><h2>Critic Forward + GAE：每一步自己的 Advantage</h2><p>先计算 δ<sub>t</sub> = r<sub>t</sub> + γV(s<sub>t+1</sub>) − V(s<sub>t</sub>)，再从后往前计算 A<sub>t</sub> = δ<sub>t</sub> + γλ A<sub>t+1</sub>；Episode 边界需要重置。</p><pre>with torch.no_grad():
+    values = critic(states).squeeze(-1)
+    next_values = critic(next_states).squeeze(-1)
+    deltas = rewards + gamma * next_values * bootstrap_mask - values
+    gae = torch.zeros_like(deltas[0])
+    advantages = torch.zeros_like(deltas)
+    for t in reversed(range(len(rewards))):
+        gae = deltas[t] + gamma * lam * continuation_mask[t] * gae
+        advantages[t] = gae
+    returns = advantages + values   # Critic 的 lambda-return target
+</pre><p><b>注意：</b>bootstrap_mask 在真正终止时为 0；continuation_mask 在 Episode 结束（包括截断）时为 0。为了简化上面只展示独立 Transition 的 GAE 递推。</p>
+<div class="mini"><label>交互：λ = <output id="lv">0.95</output> <input id="ls" type="range" min="0" max="1" step=".05" value=".95"></label><p>假设 δ=[1, 2, 3]，γ=0.9；第一步 A₁ = <b id="gaev"></b>。λ 决定未来 TD errors 传播权重。</p></div></section>
+<section class="step" id="old"><div class="eyebrow">03 / SNAPSHOT</div><h2>Old Policy：本轮优化的固定分母</h2><pre>old_log_probs = rollout_old_log_probs.detach()
+# 不能每个 epoch 都用 actor 重新覆盖 old_log_probs</pre><p>Old Policy 并不是长期冻结的 SFT Reference。下一次 Rollout 会刷新 Old 的基准。</p></section>
+<section class="step" id="is"><div class="eyebrow">04 / IMPORTANCE SAMPLING</div><h2>为什么 Actor 还没变 Ratio 却有 Gradient？</h2><pre>probs = actor(states)
+dist = torch.distributions.Categorical(probs)
+log_probs = dist.log_prob(actions)
+ratio = (log_probs - old_log_probs).exp()  # [T]
+surr1 = ratio * advantages</pre><p>第一次更新前 Ratio=1，但它仍是 θ 的函数，导数不为零。IS 将旧策略采集的 Action 重加权用于当前策略的 surrogate optimization；单步 Ratio 并不完整校正 state occupancy shift。</p></section>
+<section class="step" id="clip"><div class="eyebrow">05 / CLIPPED LOSS</div><h2>梯度进入平坦区，而非拒绝本次 Adam 更新</h2><pre>surr2 = ratio.clamp(1 - eps, 1 + eps) * advantages
+actor_loss = -torch.minimum(surr1, surr2).mean()</pre><p>A&gt;0 且 Ratio&gt;1+ε 时，不再奖励继续增加该 Action 的概率；A&lt;0 且 Ratio&lt;1−ε 时，不再奖励继续降低其概率。其他样本仍可能改变共享参数。</p>
+<div class="mini"><label>Ratio <input id="rs" type="range" min=".2" max="2" step=".05" value="1.4"> <output id="rv"></output></label>
+<label>Advantage <select id="av"><option value="1">+1</option><option value="-1">−1</option></select></label>
+<p>ε = 0.2，unclipped = <b id="un"></b>；clipped objective = <b id="cl"></b>；<b id="region"></b></p></div>
+<div class="warn">Clip 不等于确保每个 Ratio 落在 [0.8,1.2]。更新可能越界，没有 TRPO 的 Line Search。</div></section>
+<section class="step" id="critic"><div class="eyebrow">06 / VALUE LOSS</div><h2>Critic 学 Returns，不使用 IS Ratio</h2><pre>values_pred = critic(states).squeeze(-1)
+critic_loss = torch.nn.functional.mse_loss(values_pred, returns.detach())</pre><p>Critic 的 Target 来自 Rollout 期间计算的 GAE/Returns，并在这轮多次 Actor Update 中保持固定。Actor/ Critic 参数独立时，先更新谁不是算法要求。</p></section>
+<section class="step" id="update"><div class="eyebrow">07 / OPTIMIZE</div><h2>在同一批数据上做若干 Epoch</h2><pre>for epoch in range(ppo_epochs):
+    # 重新算 current_log_probs / ratio / clipped_loss
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    actor_optimizer.step()
+
+    # Critic 重新 forward，用固定 returns 回归
+    critic_optimizer.zero_grad()
+    critic_loss.backward()
+    critic_optimizer.step()
+# 注意：上面两种 loss 每个 epoch 都需要重新 forward，
+# 不能重用已经 backward 的旧计算图。</pre><p>实际训练将 Batch 切成 Minibatches，并逐个重新执行 Loss Forward + Backward。Adam 学习率和 Clip ε 是两个不同的超参数。</p></section>
+<section class="step" id="kl"><div class="eyebrow">08 / OPTIONAL CHECK</div><h2>这里 KL 是 Old vs Current，通常只做监控</h2><pre>with torch.no_grad():
+    log_ratio = new_log_probs_after_step - old_log_probs
+    ratio_after = log_ratio.exp()
+    approx_kl = (ratio_after - 1 - log_ratio).mean()
+    if approx_kl > target_kl:
+        stop_further_epochs = True
+</pre><p>这是 Old 采样下 KL(Old || Current) 的一个估计形式，计算时需要使用 Adam 更新<b>之后</b>重新 forward 的 log_probs。它不能撤销已执行的 Step。</p></section>
+<section class="step" id="compare"><div class="eyebrow">COMPARE</div><h2>PPO 与 GRPO 在哪一步分叉？</h2><table><tr><th>环节</th><th>PPO</th><th>GRPO（经典 LLM 版本）</th></tr><tr><td>Reward</td><td>逐 Transition 或序列最终 Reward</td><td>整段 Response Reward</td></tr><tr><td>Advantage</td><td>Critic + GAE，逐 Action/Token</td><td>同 Prompt Group 的 Relative Reward，逐 Response</td></tr><tr><td>Actor 更新</td><td>IS + Clip + Adam</td><td>IS + Clip + Adam</td></tr><tr><td>Critic</td><td>有</td><td>无</td></tr><tr><td>KL</td><td>可选 Old KL Monitoring</td><td>可选 Reference KL Penalty</td></tr></table><p><a href="/GRPO/">继续阅读 GRPO 的逐 Token Loss 与 Reference KL →</a></p></section><footer><a href="/">返回首页</a> · <a href="/PolicyGradient/">Policy Gradient</a> · <a href="/TRPO/">TRPO</a> · <a href="/PPO/">PPO</a> · <a href="/GRPO/">GRPO</a></footer></main><script>const ls=document.getElementById('ls');function gae(){let l=+ls.value,c=.9*l;document.getElementById('lv').textContent=l.toFixed(2);document.getElementById('gaev').textContent=(1+2*c+3*c*c).toFixed(4)}ls.oninput=gae;gae();const rs=document.getElementById('rs'),av=document.getElementById('av');function clip(){let r=+rs.value,a=+av.value,c=Math.max(.8,Math.min(1.2,r));document.getElementById('rv').textContent=r.toFixed(2);document.getElementById('un').textContent=(r*a).toFixed(2);document.getElementById('cl').textContent=Math.min(r*a,c*a).toFixed(2);document.getElementById('region').textContent=((a>0&&r>1.2)||(a<0&&r<.8))?'该样本处于平坦区，梯度为 0':'该样本仍提供 Ratio Gradient'}rs.oninput=clip;av.onchange=clip;clip();</script></body></html>
