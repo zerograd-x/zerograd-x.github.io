@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+# Search crawlers can discover the site's public content.
+Sitemap: https://zerograd-x.github.io/sitemap.xml
