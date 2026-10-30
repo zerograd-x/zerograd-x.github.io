@@ -1,0 +1,24 @@
+# LLMExp
+
+> Independent technical notes and interactive tutorials on large language model systems, reinforcement learning, and agent evaluation.
+
+Official website: https://zerograd-x.github.io/
+Language: English for the blog; some interactive tutorials are in Chinese.
+
+## Technical writing
+- [Blog index](https://zerograd-x.github.io/blog/): Published engineering notes.
+- [Optimizing Constrained Decoding](https://zerograd-x.github.io/blog/optimizing-constrained-decoding/): Candidate-driven trie traversal, exclusion filtering, native execution, CUDA synchronization, correctness, and benchmarking methodology. Examples are illustrative and do not report proprietary speedups.
+
+## Interactive tutorials
+- [FlashAttention](https://zerograd-x.github.io/FlashAttention/)
+- [Policy Gradient](https://zerograd-x.github.io/PolicyGradient/)
+- [TRPO](https://zerograd-x.github.io/TRPO/)
+- [PPO](https://zerograd-x.github.io/PPO/)
+- [GRPO](https://zerograd-x.github.io/GRPO/)
+- [RL algorithm comparison](https://zerograd-x.github.io/RLCompare/)
+
+## Feeds and discovery
+- [RSS](https://zerograd-x.github.io/feed.xml)
+- [Sitemap](https://zerograd-x.github.io/sitemap.xml)
+
+This file is a convenience index for readers and AI tools, not an indexing guarantee or a substitute for ordinary HTML links.
