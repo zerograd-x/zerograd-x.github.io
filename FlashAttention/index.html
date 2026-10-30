@@ -325,11 +325,17 @@ input[type=range]{accent-color:#4f46e5}
 /* Keep the long introductory hero in normal document flow. The global theme's
    header sticky rule otherwise pins the introductory paragraphs to the viewport. */
 header.hero{position:static!important;top:auto!important;z-index:auto!important}
+
+/* Editorial shell, without changing interactive demo colors or its theme toggle. */
+:root{--bg:#faf9f6;--bg-soft:#f3f2ee;--bg-code:#eff1ef;--paper:#fffefd;--fg:#26323d;--fg-soft:#64717d;--fg-faint:#8a969e;--line:#e6e4df;--line-strong:#d9d8d2;--accent:#496f89;--accent-soft:#e8eff2}
+#topbar{background:color-mix(in srgb,var(--bg) 96%,transparent)}
+.llmexp-back{font:650 12px/1.3 ui-sans-serif,system-ui,sans-serif;color:var(--accent);text-decoration:none;white-space:nowrap;padding-right:9px;border-right:1px solid var(--line)}
+@media(max-width:680px){.llmexp-back{font-size:11px;padding-right:5px}#topbar .brand{font-size:12px}}
 </style>
 <!-- Cloudflare Web Analytics --><script type='module' src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "473e449cb38c4c8e9a7092ccba2610f5"}'></script><!-- End Cloudflare Web Analytics --></head>
 <body>
 
-<div id="topbar">
+<div id="topbar"><a class="llmexp-back" href="/labs/" aria-label="Back to LLMExp labs">← LLMExp / Labs</a>
   <div class="brand">Flash<em>Attention</em> — attention → softmax → the problem → the fix → what came after</div>
   <div class="spacer"></div>
   <button id="focusBtn" title="Dim everything except the passage you click">◎ Focus</button>
