@@ -99,3 +99,16 @@ body.editorial-light{
  .editorial-light .article-body pre{padding:15px}
  .editorial-light .toc{gap:8px 13px}
 }
+
+/* Labs list: typography-first, light like the rest of the journal. */
+.editorial-light .labs-journal{max-width:800px;padding-top:76px}
+.editorial-light .labs-journal h1{font-size:clamp(38px,5vw,54px);letter-spacing:-.045em}
+.editorial-light .labs-journal .lead{font-size:17px;line-height:1.85;max-width:680px;color:#53636e;margin-bottom:40px}
+.editorial-light .labs-list{display:grid;grid-template-columns:1fr;border-top:1px solid #e6e4df}
+.editorial-light .labs-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 26px;align-items:center;padding:23px 4px;border-bottom:1px solid #e6e4df;background:transparent!important;border-radius:0;box-shadow:none;text-decoration:none;color:#26323d}
+.editorial-light .labs-item h3{grid-column:1;font-size:21px;font-weight:660;letter-spacing:-.025em;line-height:1.4;margin:0;color:#2a3843}
+.editorial-light .labs-item p{grid-column:1;margin:0;font-size:14px;line-height:1.7;color:#687781}
+.editorial-light .labs-item .labs-arrow{grid-column:2;grid-row:1 / span 2;color:#698da4;font-size:18px;transition:transform .15s}
+.editorial-light .labs-item:hover h3{color:#496f89}
+.editorial-light .labs-item:hover .labs-arrow{transform:translate(2px,-2px)}
+@media(max-width:650px){.editorial-light .labs-journal{padding-top:43px}.editorial-light .labs-item{padding:20px 0}.editorial-light .labs-item h3{font-size:19px}}
