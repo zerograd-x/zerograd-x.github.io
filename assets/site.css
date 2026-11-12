@@ -112,3 +112,15 @@ body.editorial-light{
 .editorial-light .labs-item:hover h3{color:#496f89}
 .editorial-light .labs-item:hover .labs-arrow{transform:translate(2px,-2px)}
 @media(max-width:650px){.editorial-light .labs-journal{padding-top:43px}.editorial-light .labs-item{padding:20px 0}.editorial-light .labs-item h3{font-size:19px}}
+
+/* Homepage profile: retain the full harbour scene without cropping. */
+.profile-intro{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:32px;align-items:start;margin-top:26px}
+.profile-copy{min-width:0}
+.profile-copy .lead{margin-top:0}
+.profile-portrait{margin:0}
+.profile-portrait img{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:10px}
+.profile-portrait figcaption{margin-top:9px;color:var(--muted);font-size:12px;line-height:1.5}
+@media(max-width:650px){
+ .profile-intro{grid-template-columns:minmax(0,1fr);gap:26px}
+ .profile-portrait{width:min(100%,360px)}
+}
